@@ -42,66 +42,49 @@ app.get("/", (req, res) => {
 // --------- Safepay create checkout ---------
 app.post("/api/safepay/create", async (req, res) => {
   try {
-    const { amount, currency = "PKR", orderId } = req.body;
+    console.log("SAFE_PAY_SECRET_KEY present? ", !!process.env.SAFE_PAY_SECRET_KEY);
 
-    if (!amount) {
-      return res.status(400).json({ error: "Amount is required" });
+    const response = await axios.post(
+      "https://sandbox.api.getsafepay.com/v1/orders",
+      {
+        amount: req.body.amount,
+        currency: "PKR",
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.SAFE_PAY_SECRET_KEY}`,
+          "Content-Type": "application/json",
+        },
+        maxRedirects: 0, // 🔸 redirect follow mat karo (important)
+        validateStatus: () => true, // sab status codes allow
+      }
+    );
+
+    console.log("Safepay status:", response.status);
+    console.log("Safepay headers:", response.headers["content-type"]);
+    console.log("Safepay raw data:", response.data);
+
+    // agar 200 + JSON aaye to hi aage bhejo
+    if (
+      response.status === 200 &&
+      typeof response.data === "object" &&
+      response.data
+    ) {
+      return res.json(response.data);
     }
 
-    // 1) Safepay ko order init request
-    const body = {
-      client: SAFE_PAY_CLIENT,
-      amount: Number(amount),
-      currency,
-      environment: SAFE_PAY_ENV,
-    };
-
-    // IMPORTANT: ye wahi endpoint hai jo Safepay examples me hai
-    const initUrl = `${SAFE_PAY_BASE_URL}/order/v1/init`;
-
-    const safepayResp = await axios.post(initUrl, body);
-    const token = safepayResp.data?.data?.token;
-
-    if (!token) {
-      console.error("Safepay init response without token:", safepayResp.data);
-      return res
-        .status(500)
-        .json({ error: "Safepay token not found in response" });
-    }
-
-    // 2) Ab checkout URL banaate hain
-    const qs = new URLSearchParams({
-      env: SAFE_PAY_ENV,
-      beacon: token, // Safepay ka token
-      source: "website",
-      order_id: orderId || `ORD-${Date.now()}`,
-    });
-
-    if (FRONTEND_SUCCESS_URL) {
-      qs.append("redirect_url", FRONTEND_SUCCESS_URL);
-    }
-    if (FRONTEND_CANCEL_URL) {
-      qs.append("cancel_url", FRONTEND_CANCEL_URL);
-    }
-
-    const checkoutUrl = `${SAFE_PAY_BASE_URL}/components?${qs.toString()}`;
-
-    // Frontend ko simple, clean response
-    return res.json({
-      checkoutUrl,
-      token,
+    // warna front-end ko clear error bhejo
+    return res.status(500).json({
+      error: "Invalid Safepay response",
+      status: response.status,
+      dataType: typeof response.data,
     });
   } catch (err) {
-    console.error(
-      "Safepay init error:",
-      err.response?.data || err.message || err
-    );
-    return res.status(500).json({
-      error: "Safepay Error",
-      details: err.response?.data || err.message || "Unknown error",
-    });
+    console.error("Safepay server error:", err);
+    res.status(500).json({ error: "Safepay Error" });
   }
 });
+
 
 // --------- Webhook (abhi sirf log) ---------
 app.post("/api/safepay/webhook", (req, res) => {
