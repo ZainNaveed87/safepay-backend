@@ -11,17 +11,17 @@ const app = express();
 // ----- Safepay Config -----
 const PORT = process.env.PORT || 5000;
 
-// Safepay PUBLIC key (yeh hi "client" hota hai)
-const SAFE_PAY_CLIENT = process.env.SAFE_PAY_PUBLIC_KEY;
+// Safepay PUBLIC (client) key
+const SAFE_PAY_CLIENT = (process.env.SAFE_PAY_PUBLIC_KEY || "").trim();
 
 // sandbox ya production
-const SAFE_PAY_ENV = process.env.SAFE_PAY_ENV || "sandbox";
+const SAFE_PAY_ENV = (process.env.SAFE_PAY_ENV || "sandbox").toLowerCase();
 
-// Order init endpoint
-const SAFE_PAY_ORDER_URL =
+// Base URL Safepay ke liye
+const SAFE_PAY_BASE_URL =
   SAFE_PAY_ENV === "production"
-    ? "https://api.getsafepay.com/order/v1/init"
-    : "https://sandbox.api.getsafepay.com/order/v1/init";
+    ? "https://api.getsafepay.com"
+    : "https://sandbox.api.getsafepay.com";
 
 // React app ke success / cancel routes
 const FRONTEND_SUCCESS_URL = process.env.FRONTEND_SUCCESS_URL;
@@ -41,118 +41,69 @@ app.get("/", (req, res) => {
 });
 
 // --------- Safepay create checkout ---------
-// --------- Safepay create checkout ---------
 app.post("/api/safepay/create", async (req, res) => {
   try {
-    const { amount, currency = "PKR", orderId } = req.body;
-    
-    console.log("=== SAFEPAY ORDER CREATION ===");
-    console.log("Amount:", amount);
-    console.log("Currency:", currency);
-    console.log("Order ID:", orderId);
-    console.log("Using base URL:", SAFE_PAY_BASE_URL);
+    const amount = Number(req.body.amount);
+    const currency = req.body.currency || "PKR";
 
-    // IMPORTANT: Safepay expects amount in paisa (smallest currency unit)
-    // For PKR, multiply by 100
-    const amountInPaisa = Math.round(amount * 100);
-    
-    const requestBody = {
-      amount: amountInPaisa,
-      currency: currency,
-      client: {
-        redirect_url: FRONTEND_SUCCESS_URL,
-        cancel_url: FRONTEND_CANCEL_URL
-      },
-      metadata: {
-        order_id: orderId || `ORD-${Date.now()}`,
-        source: "your-website"
-      }
-    };
+    if (!amount || isNaN(amount)) {
+      return res.status(400).json({ error: "Invalid amount" });
+    }
 
-    console.log("Request body:", JSON.stringify(requestBody, null, 2));
+    if (!SAFE_PAY_CLIENT) {
+      return res.status(500).json({ error: "Safepay client key missing" });
+    }
+
+    console.log("Calling Safepay /order/v1/init with:", {
+      SAFE_PAY_BASE_URL,
+      SAFE_PAY_ENV,
+      amount,
+      currency,
+    });
 
     const response = await axios.post(
       `${SAFE_PAY_BASE_URL}/order/v1/init`,
-      requestBody,
+      {
+        client: SAFE_PAY_CLIENT,
+        amount,
+        currency,
+        environment: SAFE_PAY_ENV, // "sandbox" | "production"
+      },
       {
         headers: {
-          'Authorization': `Bearer ${process.env.SAFE_PAY_SECRET_KEY}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'X-API-KEY': process.env.SAFE_PAY_PUBLIC_KEY
-        }
+          "Content-Type": "application/json",
+        },
+        // status manual handle karne ke liye
+        validateStatus: () => true,
       }
     );
 
-    console.log("Safepay Response Status:", response.status);
-    console.log("Safepay Response Data:", JSON.stringify(response.data, null, 2));
+    console.log("Safepay status:", response.status);
+    console.log("Safepay content-type:", response.headers["content-type"]);
+    console.log("Safepay raw data:", response.data);
 
-    if (response.data && response.data.data) {
-      const safepayData = response.data.data;
-      
-      // Safepay returns 'tracker' or 'beacon' as the payment token
-      const token = safepayData.tracker || safepayData.beacon;
-      
-      if (!token) {
-        console.error("No token in response:", safepayData);
-        return res.status(500).json({
-          error: "No payment token received from Safepay",
-          data: safepayData
-        });
-      }
+    const safepayData = response.data?.data || {};
+    const token = safepayData.token;
+    const environment = safepayData.environment || SAFE_PAY_ENV;
 
-      // Return data to frontend
-      return res.json({
-        success: true,
-        token: token,
-        tracker: token,
-        environment: SAFE_PAY_ENV,
-        checkout_url: `${SAFE_PAY_BASE_URL}/checkout/pay?beacon=${token}`,
-        data: safepayData
-      });
-    }
-
-    return res.status(500).json({
-      error: "Invalid response format from Safepay",
-      data: response.data
-    });
-
-  } catch (error) {
-    console.error("=== SAFEPAY ERROR ===");
-    
-    if (error.response) {
-      console.error("Status:", error.response.status);
-      console.error("Headers:", error.response.headers);
-      console.error("Data:", error.response.data);
-      
-      // Safepay specific error
-      if (error.response.status === 401) {
-        return res.status(401).json({
-          error: "Safepay Authentication Failed",
-          message: "Check your API keys. Make sure you're using Sandbox keys for sandbox environment.",
-          debug: "Status 401: Unauthorized"
-        });
-      }
-      
-      return res.status(error.response.status).json({
-        error: "Safepay API Error",
-        status: error.response.status,
-        message: error.response.data?.message || error.response.statusText,
-        data: error.response.data
-      });
-    } else if (error.request) {
-      console.error("No response received");
-      return res.status(503).json({
-        error: "Safepay API Unavailable",
-        message: "Could not connect to Safepay. Please check your network."
-      });
-    } else {
-      console.error("Request error:", error.message);
+    if (response.status !== 200 || !token) {
       return res.status(500).json({
-        error: "Failed to create order",
-        message: error.message
+        error: "Invalid Safepay response (no token)",
+        status: response.status,
+        raw: response.data,
       });
     }
+
+    // Frontend ke liye simple JSON
+    return res.json({
+      token,
+      environment,
+      successUrl: FRONTEND_SUCCESS_URL,
+      cancelUrl: FRONTEND_CANCEL_URL,
+    });
+  } catch (err) {
+    console.error("Safepay server error:", err?.response?.data || err);
+    res.status(500).json({ error: "Safepay Error", details: err?.message });
   }
 });
 
