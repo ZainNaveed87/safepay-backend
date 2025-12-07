@@ -11,16 +11,17 @@ const app = express();
 // ----- Safepay Config -----
 const PORT = process.env.PORT || 5000;
 
-// Safepay public key (staging / test wali)
+// Safepay PUBLIC key (yeh hi "client" hota hai)
 const SAFE_PAY_CLIENT = process.env.SAFE_PAY_PUBLIC_KEY;
 
 // sandbox ya production
 const SAFE_PAY_ENV = process.env.SAFE_PAY_ENV || "sandbox";
 
-const SAFE_PAY_BASE_URL =
+// Order init endpoint
+const SAFE_PAY_ORDER_URL =
   SAFE_PAY_ENV === "production"
-    ? "https://api.getsafepay.com"
-    : "https://sandbox.api.getsafepay.com";
+    ? "https://api.getsafepay.com/order/v1/init"
+    : "https://sandbox.api.getsafepay.com/order/v1/init";
 
 // React app ke success / cancel routes
 const FRONTEND_SUCCESS_URL = process.env.FRONTEND_SUCCESS_URL;
@@ -40,51 +41,120 @@ app.get("/", (req, res) => {
 });
 
 // --------- Safepay create checkout ---------
+// --------- Safepay create checkout ---------
 app.post("/api/safepay/create", async (req, res) => {
   try {
-    console.log("SAFE_PAY_SECRET_KEY present? ", !!process.env.SAFE_PAY_SECRET_KEY);
+    const { amount, currency = "PKR", orderId } = req.body;
+    
+    console.log("=== SAFEPAY ORDER CREATION ===");
+    console.log("Amount:", amount);
+    console.log("Currency:", currency);
+    console.log("Order ID:", orderId);
+    console.log("Using base URL:", SAFE_PAY_BASE_URL);
+
+    // IMPORTANT: Safepay expects amount in paisa (smallest currency unit)
+    // For PKR, multiply by 100
+    const amountInPaisa = Math.round(amount * 100);
+    
+    const requestBody = {
+      amount: amountInPaisa,
+      currency: currency,
+      client: {
+        redirect_url: FRONTEND_SUCCESS_URL,
+        cancel_url: FRONTEND_CANCEL_URL
+      },
+      metadata: {
+        order_id: orderId || `ORD-${Date.now()}`,
+        source: "your-website"
+      }
+    };
+
+    console.log("Request body:", JSON.stringify(requestBody, null, 2));
 
     const response = await axios.post(
-      "https://sandbox.api.getsafepay.com/v1/orders",
-      {
-        amount: req.body.amount,
-        currency: "PKR",
-      },
+      `${SAFE_PAY_BASE_URL}/order/v1/init`,
+      requestBody,
       {
         headers: {
-          Authorization: `Bearer ${process.env.SAFE_PAY_SECRET_KEY}`,
-          "Content-Type": "application/json",
-        },
-        maxRedirects: 0, // 🔸 redirect follow mat karo (important)
-        validateStatus: () => true, // sab status codes allow
+          'Authorization': `Bearer ${process.env.SAFE_PAY_SECRET_KEY}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'X-API-KEY': process.env.SAFE_PAY_PUBLIC_KEY
+        }
       }
     );
 
-    console.log("Safepay status:", response.status);
-    console.log("Safepay headers:", response.headers["content-type"]);
-    console.log("Safepay raw data:", response.data);
+    console.log("Safepay Response Status:", response.status);
+    console.log("Safepay Response Data:", JSON.stringify(response.data, null, 2));
 
-    // agar 200 + JSON aaye to hi aage bhejo
-    if (
-      response.status === 200 &&
-      typeof response.data === "object" &&
-      response.data
-    ) {
-      return res.json(response.data);
+    if (response.data && response.data.data) {
+      const safepayData = response.data.data;
+      
+      // Safepay returns 'tracker' or 'beacon' as the payment token
+      const token = safepayData.tracker || safepayData.beacon;
+      
+      if (!token) {
+        console.error("No token in response:", safepayData);
+        return res.status(500).json({
+          error: "No payment token received from Safepay",
+          data: safepayData
+        });
+      }
+
+      // Return data to frontend
+      return res.json({
+        success: true,
+        token: token,
+        tracker: token,
+        environment: SAFE_PAY_ENV,
+        checkout_url: `${SAFE_PAY_BASE_URL}/checkout/pay?beacon=${token}`,
+        data: safepayData
+      });
     }
 
-    // warna front-end ko clear error bhejo
     return res.status(500).json({
-      error: "Invalid Safepay response",
-      status: response.status,
-      dataType: typeof response.data,
+      error: "Invalid response format from Safepay",
+      data: response.data
     });
-  } catch (err) {
-    console.error("Safepay server error:", err);
-    res.status(500).json({ error: "Safepay Error" });
+
+  } catch (error) {
+    console.error("=== SAFEPAY ERROR ===");
+    
+    if (error.response) {
+      console.error("Status:", error.response.status);
+      console.error("Headers:", error.response.headers);
+      console.error("Data:", error.response.data);
+      
+      // Safepay specific error
+      if (error.response.status === 401) {
+        return res.status(401).json({
+          error: "Safepay Authentication Failed",
+          message: "Check your API keys. Make sure you're using Sandbox keys for sandbox environment.",
+          debug: "Status 401: Unauthorized"
+        });
+      }
+      
+      return res.status(error.response.status).json({
+        error: "Safepay API Error",
+        status: error.response.status,
+        message: error.response.data?.message || error.response.statusText,
+        data: error.response.data
+      });
+    } else if (error.request) {
+      console.error("No response received");
+      return res.status(503).json({
+        error: "Safepay API Unavailable",
+        message: "Could not connect to Safepay. Please check your network."
+      });
+    } else {
+      console.error("Request error:", error.message);
+      return res.status(500).json({
+        error: "Failed to create order",
+        message: error.message
+      });
+    }
   }
 });
-
 
 // --------- Webhook (abhi sirf log) ---------
 app.post("/api/safepay/webhook", (req, res) => {
