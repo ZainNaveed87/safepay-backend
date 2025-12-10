@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -10,13 +9,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ===== ENV =====
+// ======== ENV =========
 const CLIENT_ID = process.env.PAYPRO_CLIENT_ID;
 const CLIENT_SECRET = process.env.PAYPRO_CLIENT_SECRET;
+
+// agar tum BASE_URL env me /v2 laga chuke ho to sirf wahi use kar lo
+const PAYPRO_BASE_URL =
+  process.env.PAYPRO_BASE_URL || "https://sandbox.paypro.com.pk/v2";
+
 const FRONTEND_SUCCESS_URL = process.env.FRONTEND_SUCCESS_URL;
 const FRONTEND_CANCEL_URL = process.env.FRONTEND_CANCEL_URL;
-const PAYPRO_BASE_URL =
-  process.env.PAYPRO_BASE_URL || "https://sandbox.paypro.com.pk";
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
   console.error("❌ ERROR: PayPro credentials missing in .env");
@@ -27,32 +29,20 @@ app.get("/", (req, res) => {
   res.send("PayPro backend is running...");
 });
 
-// ===== CREATE PAYPRO PAYMENT =====
+// ===== CREATE PAYMENT =====
 app.post("/api/paypro/create", async (req, res) => {
-  const { amount, orderId } = req.body || {};
-
-  console.log("🔹 Incoming create request:", { amount, orderId });
-
-  if (!amount || !orderId) {
-    return res.status(400).json({
-      success: false,
-      message: "amount and orderId are required",
-    });
-  }
-
   try {
-    const url = `${PAYPRO_BASE_URL.replace(/\/$/, "")}/webcheckout`;
+    const { amount, orderId } = req.body;
 
-    const payload = {
-      orderId,
-      amount: amount.toString(),
-      successUrl: FRONTEND_SUCCESS_URL,
-      cancelUrl: FRONTEND_CANCEL_URL,
-      customerEmail: "customer@example.com",
-      customerPhone: "03001234567",
-    };
+    if (!amount || !orderId) {
+      return res.status(400).json({
+        success: false,
+        message: "amount and orderId are required",
+      });
+    }
 
-    console.log("🔹 Calling PayPro:", url, "payload:", payload);
+    const url = `${PAYPRO_BASE_URL}/webcheckout`;
+    console.log("Calling PayPro:", url);
 
     const response = await fetch(url, {
       method: "POST",
@@ -61,52 +51,37 @@ app.post("/api/paypro/create", async (req, res) => {
         ClientId: CLIENT_ID,
         ClientSecret: CLIENT_SECRET,
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        orderId,
+        amount: amount.toString(),
+        successUrl: FRONTEND_SUCCESS_URL,
+        cancelUrl: FRONTEND_CANCEL_URL,
+        customerEmail: "customer@example.com",
+        customerPhone: "03001234567",
+      }),
     });
 
-    const text = await response.text();
-    console.log("🔹 PayPro raw status:", response.status);
-    console.log("🔹 PayPro raw body:", text);
+    const data = await response.json();
+    console.log("PAYPRO RAW RESPONSE:", data);
 
-    let json;
-    try {
-      json = JSON.parse(text);
-    } catch (e) {
-      // PayPro ne JSON ki jagah HTML / plain text bhej diya
-      return res.status(200).json({
+    if (!data || !data?.data?.redirectUrl) {
+      return res.status(500).json({
         success: false,
-        message: "PayPro returned a non-JSON response",
-        status: response.status,
-        body: text.slice(0, 500),
+        message: "PayPro did not return redirectUrl",
+        data,
       });
     }
 
-    // Response OK nahi ya redirectUrl nahi mila
-    if (!response.ok || !json?.data?.redirectUrl) {
-      return res.status(200).json({
-        success: false,
-        message:
-          json.message ||
-          json.error ||
-          "PayPro returned an error response",
-        status: response.status,
-        raw: json,
-      });
-    }
-
-    // ✅ Success
-    return res.status(200).json({
+    return res.json({
       success: true,
-      paymentUrl: json.data.redirectUrl,
-      raw: json,
+      paymentUrl: data.data.redirectUrl,
+      raw: data,
     });
   } catch (err) {
-    console.error("❌ PayPro Error (catch):", err);
-
-    return res.status(200).json({
+    console.error("PayPro Error:", err);
+    return res.status(500).json({
       success: false,
-      message:
-        (err && err.message) || "Server error calling PayPro API (catch)",
+      message: err.message || "Server error calling PayPro API",
     });
   }
 });
