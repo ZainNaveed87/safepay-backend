@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import fetch from "node-fetch"; // IMPORTANT for Node v22
+import fetch from "node-fetch";
 
 dotenv.config();
 
@@ -9,9 +9,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ------------------------------
-// ENV VARIABLES
-// ------------------------------
 const CLIENT_ID = process.env.PAYPRO_CLIENT_ID;
 const CLIENT_SECRET = process.env.PAYPRO_CLIENT_SECRET;
 
@@ -22,16 +19,10 @@ if (!CLIENT_ID || !CLIENT_SECRET) {
   console.error("❌ ERROR: PayPro credentials missing in .env");
 }
 
-// ------------------------------
-// HEALTH CHECK
-// ------------------------------
 app.get("/", (req, res) => {
   res.send("PayPro backend is running...");
 });
 
-// ------------------------------
-// CREATE PAYMENT REQUEST
-// ------------------------------
 app.post("/api/paypro/create", async (req, res) => {
   try {
     const { amount, orderId } = req.body;
@@ -43,7 +34,6 @@ app.post("/api/paypro/create", async (req, res) => {
       });
     }
 
-    // -------------- PAYPRO API CALL --------------
     const response = await fetch("https://sandbox.paypro.com.pk/webcheckout", {
       method: "POST",
       headers: {
@@ -56,8 +46,8 @@ app.post("/api/paypro/create", async (req, res) => {
         amount: amount.toString(),
         successUrl: FRONTEND_SUCCESS_URL,
         cancelUrl: FRONTEND_CANCEL_URL,
-        customerEmail: "customer@example.com", // Optional
-        customerPhone: "03001234567", // Optional
+        customerEmail: "customer@example.com",
+        customerPhone: "03001234567",
       }),
     });
 
@@ -74,7 +64,7 @@ app.post("/api/paypro/create", async (req, res) => {
 
     return res.json({
       success: true,
-      payment_url: data.data.redirectUrl,
+      paymentUrl: data.data.redirectUrl, // ✅ yahan rename
       raw: data,
     });
   } catch (err) {
@@ -86,10 +76,6 @@ app.post("/api/paypro/create", async (req, res) => {
   }
 });
 
-
-// ------------------------------
-// SERVER START
-// ------------------------------
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
