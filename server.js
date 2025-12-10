@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -9,46 +10,49 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ================== ENV VARS ==================
+// ===== ENV =====
 const CLIENT_ID = process.env.PAYPRO_CLIENT_ID;
 const CLIENT_SECRET = process.env.PAYPRO_CLIENT_SECRET;
-
-// e.g. https://sandbox.paypro.com.pk/v2
-const PAYPRO_BASE_URL =
-  process.env.PAYPRO_BASE_URL || "https://sandbox.paypro.com.pk/v2";
-
 const FRONTEND_SUCCESS_URL = process.env.FRONTEND_SUCCESS_URL;
 const FRONTEND_CANCEL_URL = process.env.FRONTEND_CANCEL_URL;
+const PAYPRO_BASE_URL =
+  process.env.PAYPRO_BASE_URL || "https://sandbox.paypro.com.pk";
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
   console.error("❌ ERROR: PayPro credentials missing in .env");
 }
-if (!FRONTEND_SUCCESS_URL || !FRONTEND_CANCEL_URL) {
-  console.warn("⚠️ FRONTEND_SUCCESS_URL / FRONTEND_CANCEL_URL missing");
-}
 
-console.log("✅ Using PayPro base URL:", PAYPRO_BASE_URL);
-
-// ================== HEALTH CHECK ==================
+// ===== HEALTH CHECK =====
 app.get("/", (req, res) => {
   res.send("PayPro backend is running...");
 });
 
-// ================== CREATE PAYMENT ==================
+// ===== CREATE PAYPRO PAYMENT =====
 app.post("/api/paypro/create", async (req, res) => {
+  const { amount, orderId } = req.body || {};
+
+  console.log("🔹 Incoming create request:", { amount, orderId });
+
+  if (!amount || !orderId) {
+    return res.status(400).json({
+      success: false,
+      message: "amount and orderId are required",
+    });
+  }
+
   try {
-    const { amount, orderId } = req.body;
+    const url = `${PAYPRO_BASE_URL.replace(/\/$/, "")}/webcheckout`;
 
-    if (!amount || !orderId) {
-      return res.status(400).json({
-        success: false,
-        message: "amount and orderId are required",
-      });
-    }
+    const payload = {
+      orderId,
+      amount: amount.toString(),
+      successUrl: FRONTEND_SUCCESS_URL,
+      cancelUrl: FRONTEND_CANCEL_URL,
+      customerEmail: "customer@example.com",
+      customerPhone: "03001234567",
+    };
 
-    // ---- Call PayPro sandbox ----
-    const url = `${PAYPRO_BASE_URL}/webcheckout`; // <-- important
-    console.log("📡 Calling PayPro:", url, "amount:", amount, "orderId:", orderId);
+    console.log("🔹 Calling PayPro:", url, "payload:", payload);
 
     const response = await fetch(url, {
       method: "POST",
@@ -57,70 +61,57 @@ app.post("/api/paypro/create", async (req, res) => {
         ClientId: CLIENT_ID,
         ClientSecret: CLIENT_SECRET,
       },
-      body: JSON.stringify({
-        orderId,
-        amount: amount.toString(),
-        successUrl: FRONTEND_SUCCESS_URL,
-        cancelUrl: FRONTEND_CANCEL_URL,
-        customerEmail: "customer@example.com",
-        customerPhone: "03001234567",
-      }),
+      body: JSON.stringify(payload),
     });
 
     const text = await response.text();
-    console.log("🔍 PayPro raw response status:", response.status);
-    console.log("🔍 PayPro raw body:", text);
+    console.log("🔹 PayPro raw status:", response.status);
+    console.log("🔹 PayPro raw body:", text);
 
-    let data;
+    let json;
     try {
-      data = JSON.parse(text);
+      json = JSON.parse(text);
     } catch (e) {
-      console.error("❌ Could not parse PayPro JSON:", e);
-      return res.status(500).json({
+      // PayPro ne JSON ki jagah HTML / plain text bhej diya
+      return res.status(200).json({
         success: false,
-        message: "Invalid JSON from PayPro",
-        raw: text,
+        message: "PayPro returned a non-JSON response",
+        status: response.status,
+        body: text.slice(0, 500),
       });
     }
 
-    // Agar PayPro ne khud error diya ho
-    if (!response.ok || data.status === "error" || data.success === false) {
-      console.error("❌ PayPro returned error:", data);
-      return res.status(500).json({
+    // Response OK nahi ya redirectUrl nahi mila
+    if (!response.ok || !json?.data?.redirectUrl) {
+      return res.status(200).json({
         success: false,
-        message: data.message || data.error || "PayPro API error",
-        raw: data,
-      });
-    }
-
-    const redirectUrl =
-      data?.data?.redirectUrl || data?.redirectUrl || data?.url;
-
-    if (!redirectUrl) {
-      return res.status(500).json({
-        success: false,
-        message: "PayPro did not return redirectUrl",
-        raw: data,
+        message:
+          json.message ||
+          json.error ||
+          "PayPro returned an error response",
+        status: response.status,
+        raw: json,
       });
     }
 
     // ✅ Success
-    return res.json({
+    return res.status(200).json({
       success: true,
-      paymentUrl: redirectUrl,
-      raw: data,
+      paymentUrl: json.data.redirectUrl,
+      raw: json,
     });
   } catch (err) {
-    console.error("🔥 PayPro Error (catch):", err);
-    return res.status(500).json({
+    console.error("❌ PayPro Error (catch):", err);
+
+    return res.status(200).json({
       success: false,
-      message: "Server error calling PayPro API",
-      error: String(err),
+      message:
+        (err && err.message) || "Server error calling PayPro API (catch)",
     });
   }
 });
 
-// ================== START SERVER ==================
+// ===== START SERVER =====
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
