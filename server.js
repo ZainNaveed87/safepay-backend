@@ -15,7 +15,7 @@ const CLIENT_SECRET = process.env.PAYPRO_CLIENT_SECRET;
 
 // agar tum BASE_URL env me /v2 laga chuke ho to sirf wahi use kar lo
 const PAYPRO_BASE_URL =
-  process.env.PAYPRO_BASE_URL || "https://sandbox.paypro.com.pk/v2";
+  process.env.PAYPRO_BASE_URL || "https://demoapi.paypro.com.pk/v2";
 
 const FRONTEND_SUCCESS_URL = process.env.FRONTEND_SUCCESS_URL;
 const FRONTEND_CANCEL_URL = process.env.FRONTEND_CANCEL_URL;
