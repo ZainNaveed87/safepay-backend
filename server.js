@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -13,7 +14,8 @@ app.use(express.json());
 const CLIENT_ID = process.env.PAYPRO_CLIENT_ID;
 const CLIENT_SECRET = process.env.PAYPRO_CLIENT_SECRET;
 
-// ⚠️ DEMO ke liye:
+// ⚠️ DEMO / TEST BASE URL
+// .env me: PAYPRO_BASE_URL=https://demoapi.paypro.com.pk/v2
 const PAYPRO_BASE_URL =
   process.env.PAYPRO_BASE_URL || "https://demoapi.paypro.com.pk/v2";
 
@@ -22,7 +24,14 @@ const FRONTEND_CANCEL_URL = process.env.FRONTEND_CANCEL_URL;
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
   console.error("❌ ERROR: PayPro credentials missing in .env");
+} else {
+  console.log("✅ PayPro credentials loaded from .env");
+  console.log("   CLIENT_ID:", CLIENT_ID);
 }
+
+console.log("✅ PAYPRO_BASE_URL:", PAYPRO_BASE_URL);
+console.log("✅ FRONTEND_SUCCESS_URL:", FRONTEND_SUCCESS_URL);
+console.log("✅ FRONTEND_CANCEL_URL:", FRONTEND_CANCEL_URL);
 
 // ===== HEALTH CHECK =====
 app.get("/", (req, res) => {
@@ -32,7 +41,9 @@ app.get("/", (req, res) => {
 // ===== CREATE PAYMENT =====
 app.post("/api/paypro/create", async (req, res) => {
   try {
-    const { amount, orderId } = req.body;
+    const { amount, orderId, customer } = req.body;
+
+    console.log("🔹 Incoming /api/paypro/create body:", req.body);
 
     if (!amount || !orderId) {
       return res.status(400).json({
@@ -48,6 +59,7 @@ app.post("/api/paypro/create", async (req, res) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        // Agar docs me Token chahiye ho to yahan Token: '...' use karna hoga
         ClientId: CLIENT_ID,
         ClientSecret: CLIENT_SECRET,
       },
@@ -56,8 +68,9 @@ app.post("/api/paypro/create", async (req, res) => {
         amount: amount.toString(),
         successUrl: FRONTEND_SUCCESS_URL,
         cancelUrl: FRONTEND_CANCEL_URL,
-        customerEmail: "customer@example.com",
-        customerPhone: "03001234567",
+        customerEmail: customer?.email || "customer@example.com",
+        customerPhone: customer?.phone || "03001234567",
+        customerName: customer?.fullName || "Secrets Discounts Customer",
       }),
     });
 
@@ -65,21 +78,25 @@ app.post("/api/paypro/create", async (req, res) => {
     const rawBody = await response.text();
 
     console.log("🔸 PayPro status:", response.status);
+    console.log("🔸 PayPro content-type:", contentType);
     console.log("🔸 PayPro raw body (first 500 chars):");
     console.log(rawBody.substring(0, 500));
 
-    // Agar JSON mila
+    // 🧠 Agar JSON mila ho to JSON parse karein
     if (contentType.includes("application/json")) {
       let data;
       try {
         data = JSON.parse(rawBody);
       } catch (e) {
+        console.error("❌ JSON parse error for PayPro response:", e);
         return res.status(500).json({
           success: false,
           message: "PayPro returned invalid JSON",
           raw: rawBody,
         });
       }
+
+      console.log("✅ PAYPRO JSON RESPONSE:", data);
 
       if (!response.ok) {
         return res.status(response.status).json({
@@ -98,6 +115,7 @@ app.post("/api/paypro/create", async (req, res) => {
         });
       }
 
+      // ✅ Success – frontend ko payment URL de do
       return res.json({
         success: true,
         paymentUrl: data.data.redirectUrl,
@@ -105,7 +123,7 @@ app.post("/api/paypro/create", async (req, res) => {
       });
     }
 
-    // Agar JSON nahi, koi HTML / error page mila
+    // 🧠 Agar JSON nahi aya (HTML / error page aya)
     return res.status(response.status || 500).json({
       success: false,
       message: `PayPro returned non-JSON response (status ${response.status})`,
