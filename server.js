@@ -13,7 +13,7 @@ app.use(express.json());
 const CLIENT_ID = process.env.PAYPRO_CLIENT_ID;
 const CLIENT_SECRET = process.env.PAYPRO_CLIENT_SECRET;
 
-// agar tum BASE_URL env me /v2 laga chuke ho to sirf wahi use kar lo
+// ⚠️ DEMO ke liye:
 const PAYPRO_BASE_URL =
   process.env.PAYPRO_BASE_URL || "https://demoapi.paypro.com.pk/v2";
 
@@ -42,7 +42,7 @@ app.post("/api/paypro/create", async (req, res) => {
     }
 
     const url = `${PAYPRO_BASE_URL}/webcheckout`;
-    console.log("Calling PayPro:", url);
+    console.log("🔸 Calling PayPro:", url);
 
     const response = await fetch(url, {
       method: "POST",
@@ -61,24 +61,58 @@ app.post("/api/paypro/create", async (req, res) => {
       }),
     });
 
-    const data = await response.json();
-    console.log("PAYPRO RAW RESPONSE:", data);
+    const contentType = response.headers.get("content-type") || "";
+    const rawBody = await response.text();
 
-    if (!data || !data?.data?.redirectUrl) {
-      return res.status(500).json({
-        success: false,
-        message: "PayPro did not return redirectUrl",
-        data,
+    console.log("🔸 PayPro status:", response.status);
+    console.log("🔸 PayPro raw body (first 500 chars):");
+    console.log(rawBody.substring(0, 500));
+
+    // Agar JSON mila
+    if (contentType.includes("application/json")) {
+      let data;
+      try {
+        data = JSON.parse(rawBody);
+      } catch (e) {
+        return res.status(500).json({
+          success: false,
+          message: "PayPro returned invalid JSON",
+          raw: rawBody,
+        });
+      }
+
+      if (!response.ok) {
+        return res.status(response.status).json({
+          success: false,
+          message:
+            data.message || data.error || "PayPro responded with an error",
+          raw: data,
+        });
+      }
+
+      if (!data || !data?.data?.redirectUrl) {
+        return res.status(500).json({
+          success: false,
+          message: "PayPro did not return redirectUrl",
+          data,
+        });
+      }
+
+      return res.json({
+        success: true,
+        paymentUrl: data.data.redirectUrl,
+        raw: data,
       });
     }
 
-    return res.json({
-      success: true,
-      paymentUrl: data.data.redirectUrl,
-      raw: data,
+    // Agar JSON nahi, koi HTML / error page mila
+    return res.status(response.status || 500).json({
+      success: false,
+      message: `PayPro returned non-JSON response (status ${response.status})`,
+      raw: rawBody,
     });
   } catch (err) {
-    console.error("PayPro Error:", err);
+    console.error("❌ PayPro Error (outer catch):", err);
     return res.status(500).json({
       success: false,
       message: err.message || "Server error calling PayPro API",
