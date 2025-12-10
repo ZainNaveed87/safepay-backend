@@ -1,5 +1,5 @@
 {
-  "name": "safepay-backend",
+  "name": "paypro-backend",
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
@@ -10,6 +10,7 @@
     "axios": "^1.7.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.0",
-    "express": "^4.19.0"
+    "express": "^4.19.0",
+    "node-fetch": "^2.6.7"
   }
 }
