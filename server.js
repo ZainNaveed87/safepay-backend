@@ -6,8 +6,17 @@ import axios from "axios";
 
 const app = express();
 
+// ✅ Render sets PORT automatically. Keep fallback for local dev.
 const PORT = Number(process.env.PORT || 5050);
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:8080";
+
+// ✅ Allow multiple origins (comma-separated) for local + production
+// Example env:
+// FRONTEND_ORIGIN=https://secretsdiscounts.com,http://localhost:8080
+const FRONTEND_ORIGINS_RAW =
+  process.env.FRONTEND_ORIGIN || "http://localhost:8080";
+const FRONTEND_ORIGINS = FRONTEND_ORIGINS_RAW.split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 // ---- ENV ----
 const PAYPRO_BASE_URL = (process.env.PAYPRO_BASE_URL || "").replace(/\/$/, ""); // e.g. https://api.paypro.com.pk
@@ -22,7 +31,8 @@ const PAYPRO_RETURN_URL =
 const PAYPRO_CANCEL_URL =
   process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel";
 
-// Keep these default as PayPro v2 doc style
+// ✅ IMPORTANT: default auth path should be PayPro ppro family
+// (tumhare previous tests me /auth HTML/404 aata tha)
 const PAYPRO_AUTH_PATH = (process.env.PAYPRO_AUTH_PATH || "/v2/ppro/auth").trim();
 const PAYPRO_CREATE_ORDER_PATH = (process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co").trim();
 
@@ -31,18 +41,34 @@ const PAYPRO_CALLBACK_USERNAME =
   (process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || "").trim();
 const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").trim();
 
+// ✅ behind proxies (Render etc.) helpful for IP/https detection
+app.set("trust proxy", 1);
+
 // ---- MIDDLEWARE ----
 app.use(
   cors({
-    origin: FRONTEND_ORIGIN,
+    origin: function (origin, cb) {
+      // allow server-to-server requests (no Origin), Postman, PayPro etc.
+      if (!origin) return cb(null, true);
+
+      if (FRONTEND_ORIGINS.includes(origin)) return cb(null, true);
+
+      return cb(new Error(`CORS blocked for origin: ${origin}`), false);
+    },
     credentials: true,
   })
 );
+
 app.use(express.json({ limit: "2mb" }));
 
 app.get("/", (req, res) => res.send("PayPro backend running."));
 app.get("/health", (req, res) =>
-  res.json({ ok: true, service: "paypro-backend", port: PORT })
+  res.json({
+    ok: true,
+    service: "paypro-backend",
+    port: PORT,
+    allowedOrigins: FRONTEND_ORIGINS,
+  })
 );
 
 // ---- HELPERS ----
@@ -88,7 +114,7 @@ function isHtmlResponse(headers, body) {
 
 function looksLikeInvalidKeys(body) {
   const s = String(body || "").trim().toLowerCase();
-  return s.includes("invalid keys") || s.includes("inValid keys".toLowerCase());
+  return s.includes("invalid keys") || s.includes("invalid key");
 }
 
 function detectTokenFromHeaders(headers) {
@@ -167,8 +193,7 @@ function formatDDMMYYYY(d) {
 }
 
 // ---- AUTH (LIVE candidates) ----
-// Tumhare tests ke mutabiq /v2/auth aur /auth HTML/404 de rahe hain,
-// so hum sirf PayPro "ppro" family paths keep kar rahe hain.
+// /v2/ppro/auth family (safe)
 async function getPayProToken() {
   requireEnvOrThrow();
 
@@ -258,7 +283,9 @@ app.post("/api/paypro/initiate", async (req, res) => {
     requireEnvOrThrow();
 
     const { orderId, amount, customer, description } = req.body || {};
-    if (!orderId) return res.status(400).json({ ok: false, message: "orderId is required" });
+    if (!orderId) {
+      return res.status(400).json({ ok: false, message: "orderId is required" });
+    }
 
     const numericAmount = Number(amount);
     if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
@@ -338,6 +365,8 @@ app.post("/api/paypro/initiate", async (req, res) => {
 });
 
 // ---- CALLBACK (PayPro -> Your API) ----
+// ✅ Put THIS URL in PayPro panel UIS/Callback:
+// https://YOUR-RENDER-DOMAIN/paypro/uis
 app.post("/paypro/uis", async (req, res) => {
   try {
     const { username, password, csvinvoiceids } = req.body || {};
@@ -355,12 +384,20 @@ app.post("/paypro/uis", async (req, res) => {
     // verify callback creds (recommended)
     if (PAYPRO_CALLBACK_USERNAME && username !== PAYPRO_CALLBACK_USERNAME) {
       return res.status(401).json([
-        { StatusCode: "01", InvoiceID: null, Description: "Invalid Data. Username or password is invalid" },
+        {
+          StatusCode: "01",
+          InvoiceID: null,
+          Description: "Invalid Data. Username or password is invalid",
+        },
       ]);
     }
     if (PAYPRO_CALLBACK_PASSWORD && password !== PAYPRO_CALLBACK_PASSWORD) {
       return res.status(401).json([
-        { StatusCode: "01", InvoiceID: null, Description: "Invalid Data. Username or password is invalid" },
+        {
+          StatusCode: "01",
+          InvoiceID: null,
+          Description: "Invalid Data. Username or password is invalid",
+        },
       ]);
     }
 
@@ -382,6 +419,14 @@ app.post("/paypro/uis", async (req, res) => {
       { StatusCode: "02", InvoiceID: null, Description: "Service Failure" },
     ]);
   }
+});
+
+// ✅ Nice: show if CORS error happens
+app.use((err, req, res, next) => {
+  if (err?.message?.startsWith("CORS blocked")) {
+    return res.status(403).json({ ok: false, message: err.message });
+  }
+  return next(err);
 });
 
 app.listen(PORT, () => console.log(`PayPro backend running on port ${PORT}`));
