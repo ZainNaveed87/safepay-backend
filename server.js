@@ -1,188 +1,387 @@
-// server/index.js
+// paypro-backend/server.js
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import axios from "axios";
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 
-// -------------------- CONFIG (ENV recommended) --------------------
-const PAYPRO_BASE = "https://demoapi.paypro.com.pk/v2";
+const PORT = Number(process.env.PORT || 5050);
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:8080";
 
-// PayPro Auth (clientid/clientsecret) :contentReference[oaicite:3]{index=3}
-const PAYPRO_CLIENT_ID = process.env.PAYPRO_CLIENT_ID || "YOUR_CLIENT_ID";
-const PAYPRO_CLIENT_SECRET = process.env.PAYPRO_CLIENT_SECRET || "YOUR_CLIENT_SECRET";
+// ---- ENV ----
+const PAYPRO_BASE_URL = (process.env.PAYPRO_BASE_URL || "").replace(/\/$/, ""); // e.g. https://api.paypro.com.pk
+const PAYPRO_CLIENT_ID = (process.env.PAYPRO_CLIENT_ID || "").trim();
+const PAYPRO_CLIENT_SECRET = (process.env.PAYPRO_CLIENT_SECRET || "").trim();
 
-// MerchantId (provided username) order create body me jata hai :contentReference[oaicite:4]{index=4}
-const PAYPRO_MERCHANT_ID = process.env.PAYPRO_MERCHANT_ID || "YOUR_MERCHANT_USERNAME";
+const PAYPRO_MERCHANT_ID =
+  (process.env.PAYPRO_MERCHANT_ID || process.env.PAYPRO_USERNAME || "").trim();
 
-// Callback basic auth (PayPro tumhari API ko username/password bhejta hai) :contentReference[oaicite:5]{index=5}
-const CALLBACK_USERNAME = process.env.PAYPRO_CALLBACK_USERNAME || "xyz";
-const CALLBACK_PASSWORD = process.env.PAYPRO_CALLBACK_PASSWORD || "xyz";
+const PAYPRO_RETURN_URL =
+  process.env.PAYPRO_RETURN_URL || "http://localhost:8080/payment/success";
+const PAYPRO_CANCEL_URL =
+  process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel";
 
-// optional: frontend base url (after payment redirect if needed)
-const FRONTEND_BASE = process.env.FRONTEND_BASE || "http://localhost:5173";
+// Keep these default as PayPro v2 doc style
+const PAYPRO_AUTH_PATH = (process.env.PAYPRO_AUTH_PATH || "/v2/ppro/auth").trim();
+const PAYPRO_CREATE_ORDER_PATH = (process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co").trim();
 
-// -------------------- HELPERS --------------------
-async function payproAuthToken() {
-  const res = await fetch(`${PAYPRO_BASE}/ppro/auth`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      clientid: PAYPRO_CLIENT_ID,
-      clientsecret: PAYPRO_CLIENT_SECRET,
-    }),
-  });
+// Callback creds (PayPro -> your API)
+const PAYPRO_CALLBACK_USERNAME =
+  (process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || "").trim();
+const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").trim();
 
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data?.message || "PayPro auth failed");
+// ---- MIDDLEWARE ----
+app.use(
+  cors({
+    origin: FRONTEND_ORIGIN,
+    credentials: true,
+  })
+);
+app.use(express.json({ limit: "2mb" }));
+
+app.get("/", (req, res) => res.send("PayPro backend running."));
+app.get("/health", (req, res) =>
+  res.json({ ok: true, service: "paypro-backend", port: PORT })
+);
+
+// ---- HELPERS ----
+function requireEnvOrThrow() {
+  const missing = [];
+  if (!PAYPRO_BASE_URL) missing.push("PAYPRO_BASE_URL");
+  if (!PAYPRO_CLIENT_ID) missing.push("PAYPRO_CLIENT_ID");
+  if (!PAYPRO_CLIENT_SECRET) missing.push("PAYPRO_CLIENT_SECRET");
+  if (!PAYPRO_MERCHANT_ID) missing.push("PAYPRO_MERCHANT_ID (or PAYPRO_USERNAME)");
+  if (missing.length) {
+    const err = new Error(`Missing env: ${missing.join(", ")}`);
+    err.statusCode = 500;
+    throw err;
   }
+}
 
-  // PayPro doc me token headers me "Token" key se use hota hai :contentReference[oaicite:6]{index=6}
-  // Demo responses vary; commonly token value in data.token / data.Token etc.
-  const token =
+function makeUrl(base, pathOrUrl) {
+  const raw = (pathOrUrl || "").trim();
+  if (!raw) return base;
+  if (/^https?:\/\//i.test(raw)) return raw.replace(/\/$/, "");
+  const p = raw.startsWith("/") ? raw : `/${raw}`;
+  return `${base}${p}`;
+}
+
+function stringifySafe(v) {
+  try {
+    if (typeof v === "string") return v;
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
+function isHtmlResponse(headers, body) {
+  const ct = String(headers?.["content-type"] || "").toLowerCase();
+  if (ct.includes("text/html")) return true;
+  if (typeof body === "string") {
+    const t = body.trim().toLowerCase();
+    if (t.startsWith("<!doctype html") || t.startsWith("<html")) return true;
+  }
+  return false;
+}
+
+function looksLikeInvalidKeys(body) {
+  const s = String(body || "").trim().toLowerCase();
+  return s.includes("invalid keys") || s.includes("inValid keys".toLowerCase());
+}
+
+function detectTokenFromHeaders(headers) {
+  if (!headers) return null;
+
+  const direct =
+    headers["token"] ||
+    headers["Token"] ||
+    headers["TOKEN"] ||
+    headers["x-token"] ||
+    headers["X-Token"] ||
+    headers["x-auth-token"] ||
+    headers["X-Auth-Token"] ||
+    headers["access-token"] ||
+    headers["Access-Token"] ||
+    null;
+
+  if (direct) return direct;
+
+  for (const [k, v] of Object.entries(headers)) {
+    const key = String(k || "").toLowerCase();
+    if (
+      key === "token" ||
+      key === "x-token" ||
+      key === "x-auth-token" ||
+      key === "access-token"
+    ) {
+      return v;
+    }
+  }
+  return null;
+}
+
+function detectTokenFromBody(data) {
+  return (
     data?.token ||
     data?.Token ||
     data?.access_token ||
-    data?.AccessToken ||
-    data?.AuthorizationToken;
+    data?.data?.token ||
+    data?.data?.access_token ||
+    null
+  );
+}
 
-  if (!token) {
-    throw new Error("PayPro token missing in response");
+function detectRedirectUrl(data) {
+  if (!data) return null;
+
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      const u = detectRedirectUrl(item);
+      if (u) return u;
+    }
+    return null;
   }
-  return token;
+
+  return (
+    data.Click2Pay ||
+    data.short_Click2Pay ||
+    data.IframeClick2Pay ||
+    data.BillUrl ||
+    data.short_BillUrl ||
+    data.data?.Click2Pay ||
+    data.data?.short_Click2Pay ||
+    data.data?.IframeClick2Pay ||
+    data.data?.BillUrl ||
+    data.data?.short_BillUrl ||
+    null
+  );
 }
 
-function ddmmyyyy(date = new Date()) {
-  const d = String(date.getDate()).padStart(2, "0");
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const y = date.getFullYear();
-  return `${d}/${m}/${y}`;
+function formatDDMMYYYY(d) {
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  return `${dd}/${mm}/${yyyy}`;
 }
 
-function plusDays(n) {
-  const d = new Date();
-  d.setDate(d.getDate() + n);
-  return d;
+// ---- AUTH (LIVE candidates) ----
+// Tumhare tests ke mutabiq /v2/auth aur /auth HTML/404 de rahe hain,
+// so hum sirf PayPro "ppro" family paths keep kar rahe hain.
+async function getPayProToken() {
+  requireEnvOrThrow();
+
+  // casing safe (kabhi API strict hoti hai)
+  const payload = {
+    clientid: PAYPRO_CLIENT_ID,
+    clientsecret: PAYPRO_CLIENT_SECRET,
+    ClientId: PAYPRO_CLIENT_ID,
+    ClientSecret: PAYPRO_CLIENT_SECRET,
+  };
+
+  // base variants: api + www.api
+  const baseCandidates = [
+    PAYPRO_BASE_URL,
+    PAYPRO_BASE_URL.includes("://www.")
+      ? PAYPRO_BASE_URL.replace("://www.", "://")
+      : PAYPRO_BASE_URL.replace("://", "://www."),
+  ].filter(Boolean);
+
+  // path candidates: only ppro family (safe)
+  const pathCandidates = Array.from(
+    new Set([
+      PAYPRO_AUTH_PATH || "/v2/ppro/auth",
+      "/v2/ppro/auth",
+      "/ppro/auth",
+    ])
+  );
+
+  let lastErr = null;
+
+  for (const base of baseCandidates) {
+    for (const path of pathCandidates) {
+      const authUrl = makeUrl(base, path);
+
+      const r = await axios.post(authUrl, payload, {
+        headers: { "Content-Type": "application/json" },
+        timeout: 20000,
+        validateStatus: () => true,
+      });
+
+      console.log("PayPro AUTH TRY URL:", authUrl);
+      console.log("PayPro AUTH status:", r.status);
+      console.log("PayPro AUTH content-type:", r.headers?.["content-type"]);
+      console.log("PayPro AUTH body preview:", stringifySafe(r.data).slice(0, 250));
+
+      // HTML means wrong route
+      if (isHtmlResponse(r.headers, r.data)) {
+        lastErr = `Auth returned HTML on ${authUrl}`;
+        continue;
+      }
+
+      // If PayPro returns plain text "InValid Keys"
+      if (looksLikeInvalidKeys(r.data)) {
+        lastErr = `Auth says "InValid Keys" on ${authUrl}. (Keys not accepted for this environment.)`;
+        continue;
+      }
+
+      // Non-2xx
+      if (r.status < 200 || r.status >= 300) {
+        lastErr = `Auth failed (${r.status}) on ${authUrl}: ${stringifySafe(r.data).slice(0, 200)}`;
+        continue;
+      }
+
+      // Try to extract token
+      const token = detectTokenFromHeaders(r.headers) || detectTokenFromBody(r.data);
+      if (!token) {
+        lastErr = `Auth OK but token missing on ${authUrl}`;
+        continue;
+      }
+
+      console.log("✅ PayPro AUTH OK:", authUrl);
+      return token;
+    }
+  }
+
+  const err = new Error(
+    lastErr ||
+      "Auth failed on all candidates. Check PAYPRO_BASE_URL and confirm LIVE auth endpoint from PayPro."
+  );
+  err.statusCode = 500;
+  throw err;
 }
 
-// -------------------- ROUTE A: Create PayPro Order --------------------
-// Frontend => POST /api/paypro/create-order
-// Backend => token => create order => return paymentUrl/cpayId
-app.post("/api/paypro/create-order", async (req, res) => {
+// ---- INITIATE (Create Order / CO) ----
+app.post("/api/paypro/initiate", async (req, res) => {
   try {
-    const { orderId, amount, customerName, customerEmail, customerMobile } = req.body || {};
+    requireEnvOrThrow();
 
-    if (!orderId || !amount) {
-      return res.status(400).json({ error: "orderId and amount are required" });
+    const { orderId, amount, customer, description } = req.body || {};
+    if (!orderId) return res.status(400).json({ ok: false, message: "orderId is required" });
+
+    const numericAmount = Number(amount);
+    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+      return res.status(400).json({ ok: false, message: "amount must be > 0" });
     }
 
-    const token = await payproAuthToken();
+    const token = await getPayProToken();
 
-    // Create Single Order body format PDF me array hai: [ {MerchantId}, {OrderData} ] :contentReference[oaicite:7]{index=7}
-    const body = [
+    const now = new Date();
+    const due = new Date(now);
+    due.setDate(now.getDate() + 1);
+
+    const coPayload = [
       { MerchantId: PAYPRO_MERCHANT_ID },
       {
-        OrderNumber: orderId,
-        OrderAmount: String(amount),
-        OrderDueDate: ddmmyyyy(plusDays(2)),
+        OrderNumber: String(orderId),
+        OrderAmount: String(Math.round(numericAmount)),
+        OrderDueDate: formatDDMMYYYY(due),
         OrderType: "Service",
-        IssueDate: ddmmyyyy(new Date()),
+        IssueDate: formatDDMMYYYY(now),
         OrderExpireAfterSeconds: "0",
-        CustomerName: customerName || "Customer",
-        CustomerMobile: customerMobile || "",
-        CustomerEmail: customerEmail || "",
-        CustomerAddress: "",
+        CustomerName: customer?.fullName || customer?.name || "Customer",
+        CustomerMobile: customer?.phone || "",
+        CustomerEmail: customer?.email || "",
+        CustomerAddress: customer?.address || description || "",
+        ReturnURL: PAYPRO_RETURN_URL,
+        CancelURL: PAYPRO_CANCEL_URL,
       },
     ];
 
-    const r = await fetch(`${PAYPRO_BASE}/ppro/co`, {
-      method: "POST",
+    const coUrl = makeUrl(PAYPRO_BASE_URL, PAYPRO_CREATE_ORDER_PATH);
+
+    const r = await axios.post(coUrl, coPayload, {
       headers: {
         "Content-Type": "application/json",
-        Token: token, // NOTE: header key "Token" :contentReference[oaicite:8]{index=8}
+        Token: token, // ✅ only Token
       },
-      body: JSON.stringify(body),
+      timeout: 20000,
+      validateStatus: () => true,
     });
 
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      return res.status(500).json({ error: "PayPro create order failed", raw: data });
+    console.log("PayPro CO URL:", coUrl);
+    console.log("PayPro CO status:", r.status);
+    console.log("PayPro CO content-type:", r.headers?.["content-type"]);
+    console.log("PayPro CO body preview:", stringifySafe(r.data).slice(0, 900));
+
+    if (isHtmlResponse(r.headers, r.data)) {
+      return res.status(500).json({
+        ok: false,
+        message: "CO returned HTML (wrong route). Check PAYPRO_CREATE_ORDER_PATH / BASE_URL.",
+        raw: String(r.data).slice(0, 500),
+      });
     }
 
-    // PayPro response fields docs me screenshot based; usually cpayId/paymentUrl/orderNumber
-    const cpayId = data?.cpayId || data?.CPayId || data?.cpay_id || data?.InvoiceId || data?.invoiceId;
-    const paymentUrl =
-      data?.paymentUrl ||
-      data?.PaymentUrl ||
-      data?.url ||
-      data?.URL ||
-      data?.checkoutUrl;
+    if (r.status < 200 || r.status >= 300) {
+      return res.status(500).json({
+        ok: false,
+        message: `Initiate error (${r.status}): ${stringifySafe(r.data).slice(0, 800)}`,
+        raw: r.data,
+      });
+    }
 
-    // If paymentUrl is not directly provided, you may need to build it from cpayId (depends on PayPro response).
-    // We'll return whatever we have; you can inspect console/log if needed.
-    return res.json({
-      orderNumber: orderId,
-      cpayId: cpayId || null,
-      paymentUrl: paymentUrl || null,
-      raw: data,
+    const redirectUrl = detectRedirectUrl(r.data);
+
+    return res.status(200).json({
+      ok: true,
+      orderId,
+      redirectUrl: redirectUrl || null,
+      raw: r.data,
     });
-  } catch (e) {
-    return res.status(500).json({ error: e?.message || "Server error" });
+  } catch (err) {
+    return res.status(err?.statusCode || 500).json({
+      ok: false,
+      message: err?.message || "Server error",
+    });
   }
 });
 
-// -------------------- ROUTE B: Callback API --------------------
-// PayPro => POST https://{ClientDomainName}/paypro/uis :contentReference[oaicite:9]{index=9}
-// Body: { username,password,csvinvoiceids } :contentReference[oaicite:10]{index=10}
+// ---- CALLBACK (PayPro -> Your API) ----
 app.post("/paypro/uis", async (req, res) => {
   try {
     const { username, password, csvinvoiceids } = req.body || {};
 
-    // auth validate
-    if (!username || !password || username !== CALLBACK_USERNAME || password !== CALLBACK_PASSWORD) {
-      return res.json([
+    if (!username || !password || !csvinvoiceids) {
+      return res.status(400).json([
         {
           StatusCode: "01",
           InvoiceID: null,
-          Description: "Invalid Data. Username or password is invalid",
+          Description: "Invalid Data. Username/password/csvinvoiceids missing",
         },
       ]);
     }
 
-    if (!csvinvoiceids || typeof csvinvoiceids !== "string") {
-      return res.json([
-        {
-          StatusCode: "03",
-          InvoiceID: null,
-          Description: "No data available",
-        },
+    // verify callback creds (recommended)
+    if (PAYPRO_CALLBACK_USERNAME && username !== PAYPRO_CALLBACK_USERNAME) {
+      return res.status(401).json([
+        { StatusCode: "01", InvoiceID: null, Description: "Invalid Data. Username or password is invalid" },
+      ]);
+    }
+    if (PAYPRO_CALLBACK_PASSWORD && password !== PAYPRO_CALLBACK_PASSWORD) {
+      return res.status(401).json([
+        { StatusCode: "01", InvoiceID: null, Description: "Invalid Data. Username or password is invalid" },
       ]);
     }
 
-    const ids = csvinvoiceids.split(",").map((s) => s.trim()).filter(Boolean);
+    const ids = String(csvinvoiceids)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
 
-    // ✅ YAHAN TUM APNA DB/Firestore UPDATE KAROGE
-    // Filhal demo: we just return success for each id
-    const result = ids.map((id) => ({
+    // TODO: yahan apne DB/Firestore me order paid mark karo
+    const response = ids.map((id) => ({
       StatusCode: "00",
       InvoiceID: id,
       Description: "Invoice successfully marked as paid",
     }));
 
-    return res.json(result);
-  } catch (e) {
-    return res.json([
-      {
-        StatusCode: "02",
-        InvoiceID: null,
-        Description: "Service Failure",
-      },
+    return res.status(200).json(response);
+  } catch {
+    return res.status(500).json([
+      { StatusCode: "02", InvoiceID: null, Description: "Service Failure" },
     ]);
   }
 });
 
-// -------------------- START --------------------
-const PORT = process.env.PORT || 5050;
 app.listen(PORT, () => console.log(`PayPro backend running on port ${PORT}`));
