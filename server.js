@@ -3,6 +3,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import axios from "axios";
+import nodemailer from "nodemailer";
 
 const app = express();
 
@@ -41,6 +42,13 @@ const PAYPRO_CALLBACK_USERNAME =
   (process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || "").trim();
 const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").trim();
 
+// ---- EMAIL (Hostinger SMTP via Nodemailer) ----
+const SMTP_HOST = (process.env.SMTP_HOST || "").trim(); // e.g. smtp.hostinger.com
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587); // 587 recommended
+const SMTP_USER = (process.env.SMTP_USER || "").trim(); // help@secretsdiscounts.com
+const SMTP_PASS = process.env.SMTP_PASS || ""; // your email password / app password
+const RECEIPT_FROM_NAME = (process.env.RECEIPT_FROM_NAME || "Secrets Discounts").trim();
+
 // ✅ behind proxies (Render etc.) helpful for IP/https detection
 app.set("trust proxy", 1);
 
@@ -68,6 +76,7 @@ app.get("/health", (req, res) =>
     service: "paypro-backend",
     port: PORT,
     allowedOrigins: FRONTEND_ORIGINS,
+    smtpConfigured: Boolean(SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS),
   })
 );
 
@@ -80,6 +89,19 @@ function requireEnvOrThrow() {
   if (!PAYPRO_MERCHANT_ID) missing.push("PAYPRO_MERCHANT_ID (or PAYPRO_USERNAME)");
   if (missing.length) {
     const err = new Error(`Missing env: ${missing.join(", ")}`);
+    err.statusCode = 500;
+    throw err;
+  }
+}
+
+function requireEmailEnvOrThrow() {
+  const missing = [];
+  if (!SMTP_HOST) missing.push("SMTP_HOST");
+  if (!SMTP_PORT) missing.push("SMTP_PORT");
+  if (!SMTP_USER) missing.push("SMTP_USER");
+  if (!SMTP_PASS) missing.push("SMTP_PASS");
+  if (missing.length) {
+    const err = new Error(`Missing email env: ${missing.join(", ")}`);
     err.statusCode = 500;
     throw err;
   }
@@ -191,6 +213,101 @@ function formatDDMMYYYY(d) {
   const yyyy = d.getFullYear();
   return `${dd}/${mm}/${yyyy}`;
 }
+
+// ---- EMAIL HELPERS ----
+function makeMailerTransporter() {
+  requireEmailEnvOrThrow();
+
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: Number(SMTP_PORT),
+    secure: Number(SMTP_PORT) === 465, // 465 => true, 587 => false
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
+  });
+}
+
+async function sendReceiptEmail({ to, subject, html, attachments = [] }) {
+  const transporter = makeMailerTransporter();
+  const from = `${RECEIPT_FROM_NAME} <${SMTP_USER}>`;
+
+  return transporter.sendMail({
+    from,
+    to,
+    subject,
+    html,
+    attachments,
+  });
+}
+
+// ✅ Test email route (pehle isse verify karo)
+app.get("/api/test-email", async (req, res) => {
+  try {
+    await sendReceiptEmail({
+      to: SMTP_USER, // apni email pe test
+      subject: "SMTP Test - Secrets Discounts ✅",
+      html: "<h2>Email working ✅</h2><p>This is a test email from your Render PayPro backend.</p>",
+    });
+    return res.json({ ok: true, message: "Test email sent" });
+  } catch (e) {
+    console.error("test-email error:", e?.message || e);
+    return res.status(500).json({ ok: false, message: e?.message || "Email test failed" });
+  }
+});
+
+// ✅ Receipt send endpoint (frontend ya callback ke baad call kar sakte ho)
+app.post("/api/send-receipt", async (req, res) => {
+  try {
+    const { customerEmail, customerName, orderId, amount, paymentMethod, items } = req.body || {};
+
+    if (!customerEmail || !orderId) {
+      return res.status(400).json({ ok: false, message: "customerEmail & orderId required" });
+    }
+
+    const safeName = customerName || "Customer";
+    const safeMethod = paymentMethod || "Online";
+    const safeAmount = amount ?? "";
+
+    const itemsHtml =
+      Array.isArray(items) && items.length
+        ? `<ul>${items
+            .map((i) => `<li>${i?.name || "Item"} × ${i?.qty || 1} — Rs ${i?.price || ""}</li>`)
+            .join("")}</ul>`
+        : `<p>(Items not provided)</p>`;
+
+    const html = `
+      <div style="font-family: Arial, sans-serif; line-height: 1.6;">
+        <h2 style="margin:0 0 8px;">Thanks for your order, ${safeName}!</h2>
+        <p style="margin:0 0 12px;">Your order receipt:</p>
+
+        <table cellpadding="6" style="border-collapse: collapse;">
+          <tr><td><b>Order ID</b></td><td>${orderId}</td></tr>
+          <tr><td><b>Amount</b></td><td>Rs ${safeAmount}</td></tr>
+          <tr><td><b>Payment</b></td><td>${safeMethod}</td></tr>
+        </table>
+
+        <hr style="margin:16px 0;" />
+        <h3 style="margin:0 0 8px;">Order Items</h3>
+        ${itemsHtml}
+
+        <p style="margin-top:16px;">— Secrets Discounts</p>
+      </div>
+    `;
+
+    await sendReceiptEmail({
+      to: customerEmail,
+      subject: `Order Receipt - ${orderId}`,
+      html,
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("send-receipt error:", e?.message || e);
+    return res.status(500).json({ ok: false, message: e?.message || "Failed to send receipt" });
+  }
+});
 
 // ---- AUTH (LIVE candidates) ----
 // /v2/ppro/auth family (safe)
@@ -407,6 +524,9 @@ app.post("/paypro/uis", async (req, res) => {
       .filter(Boolean);
 
     // TODO: yahan apne DB/Firestore me order paid mark karo
+    // ✅ OPTIONAL (best): yahan receipt email trigger bhi kar sakte ho,
+    // lekin customerEmail tumhare DB/Firestore se lookup hoga.
+
     const response = ids.map((id) => ({
       StatusCode: "00",
       InvoiceID: id,
