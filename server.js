@@ -3,7 +3,6 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import axios from "axios";
-import nodemailer from "nodemailer";
 
 const app = express();
 
@@ -19,7 +18,7 @@ const FRONTEND_ORIGINS = FRONTEND_ORIGINS_RAW.split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// ---- ENV ----
+// ---- PAYPRO ENV ----
 const PAYPRO_BASE_URL = (process.env.PAYPRO_BASE_URL || "").replace(/\/$/, ""); // e.g. https://api.paypro.com.pk
 const PAYPRO_CLIENT_ID = (process.env.PAYPRO_CLIENT_ID || "").trim();
 const PAYPRO_CLIENT_SECRET = (process.env.PAYPRO_CLIENT_SECRET || "").trim();
@@ -33,7 +32,6 @@ const PAYPRO_CANCEL_URL =
   process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel";
 
 // ✅ IMPORTANT: default auth path should be PayPro ppro family
-// (tumhare previous tests me /auth HTML/404 aata tha)
 const PAYPRO_AUTH_PATH = (process.env.PAYPRO_AUTH_PATH || "/v2/ppro/auth").trim();
 const PAYPRO_CREATE_ORDER_PATH = (process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co").trim();
 
@@ -42,11 +40,9 @@ const PAYPRO_CALLBACK_USERNAME =
   (process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || "").trim();
 const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").trim();
 
-// ---- EMAIL (Hostinger SMTP via Nodemailer) ----
-const SMTP_HOST = (process.env.SMTP_HOST || "").trim(); // e.g. smtp.hostinger.com
-const SMTP_PORT = Number(process.env.SMTP_PORT || 587); // 587 recommended
-const SMTP_USER = (process.env.SMTP_USER || "").trim(); // help@secretsdiscounts.com
-const SMTP_PASS = process.env.SMTP_PASS || ""; // your email password / app password
+// ---- BREVO EMAIL API ENV (NO SMTP) ----
+const BREVO_API_KEY = (process.env.BREVO_API_KEY || "").trim();
+const RECEIPT_FROM_EMAIL = (process.env.RECEIPT_FROM_EMAIL || "").trim(); // e.g. help@secretsdiscounts.com
 const RECEIPT_FROM_NAME = (process.env.RECEIPT_FROM_NAME || "Secrets Discounts").trim();
 
 // ✅ behind proxies (Render etc.) helpful for IP/https detection
@@ -76,7 +72,7 @@ app.get("/health", (req, res) =>
     service: "paypro-backend",
     port: PORT,
     allowedOrigins: FRONTEND_ORIGINS,
-    smtpConfigured: Boolean(SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS),
+    brevoConfigured: Boolean(BREVO_API_KEY && RECEIPT_FROM_EMAIL),
   })
 );
 
@@ -94,12 +90,10 @@ function requireEnvOrThrow() {
   }
 }
 
-function requireEmailEnvOrThrow() {
+function requireBrevoEnvOrThrow() {
   const missing = [];
-  if (!SMTP_HOST) missing.push("SMTP_HOST");
-  if (!SMTP_PORT) missing.push("SMTP_PORT");
-  if (!SMTP_USER) missing.push("SMTP_USER");
-  if (!SMTP_PASS) missing.push("SMTP_PASS");
+  if (!BREVO_API_KEY) missing.push("BREVO_API_KEY");
+  if (!RECEIPT_FROM_EMAIL) missing.push("RECEIPT_FROM_EMAIL");
   if (missing.length) {
     const err = new Error(`Missing email env: ${missing.join(", ")}`);
     err.statusCode = 500;
@@ -214,43 +208,50 @@ function formatDDMMYYYY(d) {
   return `${dd}/${mm}/${yyyy}`;
 }
 
-// ---- EMAIL HELPERS ----
-function makeMailerTransporter() {
-  requireEmailEnvOrThrow();
+// ---- BREVO EMAIL (HTTP API) ----
+async function sendReceiptEmail({ to, subject, html }) {
+  requireBrevoEnvOrThrow();
 
-  return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: Number(SMTP_PORT),
-    secure: Number(SMTP_PORT) === 465, // 465 => true, 587 => false
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
+  const payload = {
+    sender: {
+      name: RECEIPT_FROM_NAME,
+      email: RECEIPT_FROM_EMAIL,
     },
-  });
-}
-
-async function sendReceiptEmail({ to, subject, html, attachments = [] }) {
-  const transporter = makeMailerTransporter();
-  const from = `${RECEIPT_FROM_NAME} <${SMTP_USER}>`;
-
-  return transporter.sendMail({
-    from,
-    to,
+    to: [{ email: to }],
     subject,
-    html,
-    attachments,
+    htmlContent: html,
+  };
+
+  const r = await axios.post("https://api.brevo.com/v3/smtp/email", payload, {
+    headers: {
+      "api-key": BREVO_API_KEY,
+      "Content-Type": "application/json",
+    },
+    timeout: 20000,
+    validateStatus: () => true,
   });
+
+  // If Brevo returns error details
+  if (r.status < 200 || r.status >= 300) {
+    const msg = `Brevo error (${r.status}): ${stringifySafe(r.data).slice(0, 600)}`;
+    const err = new Error(msg);
+    err.statusCode = 500;
+    throw err;
+  }
+
+  return r.data;
 }
 
-// ✅ Test email route (pehle isse verify karo)
+// ✅ Test email route (Brevo API)
 app.get("/api/test-email", async (req, res) => {
   try {
     await sendReceiptEmail({
-      to: SMTP_USER, // apni email pe test
-      subject: "SMTP Test - Secrets Discounts ✅",
-      html: "<h2>Email working ✅</h2><p>This is a test email from your Render PayPro backend.</p>",
+      to: RECEIPT_FROM_EMAIL,
+      subject: "Brevo API Test ✅",
+      html: "<h2>Email working via Brevo API 🎉</h2><p>This email is sent from Render without SMTP.</p>",
     });
-    return res.json({ ok: true, message: "Test email sent" });
+
+    return res.json({ ok: true, message: "Email sent via Brevo API" });
   } catch (e) {
     console.error("test-email error:", e?.message || e);
     return res.status(500).json({ ok: false, message: e?.message || "Email test failed" });
@@ -524,8 +525,8 @@ app.post("/paypro/uis", async (req, res) => {
       .filter(Boolean);
 
     // TODO: yahan apne DB/Firestore me order paid mark karo
-    // ✅ OPTIONAL (best): yahan receipt email trigger bhi kar sakte ho,
-    // lekin customerEmail tumhare DB/Firestore se lookup hoga.
+    // NOTE: Receipt email trigger karna ho to yahan DB se customer email lookup karke
+    // sendReceiptEmail() call kar sakte ho.
 
     const response = ids.map((id) => ({
       StatusCode: "00",
