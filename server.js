@@ -18,34 +18,6 @@ const FRONTEND_ORIGINS = FRONTEND_ORIGINS_RAW.split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// ---- PAYPRO ENV ----
-const PAYPRO_BASE_URL = (process.env.PAYPRO_BASE_URL || "").replace(/\/$/, ""); // e.g. https://api.paypro.com.pk
-const PAYPRO_CLIENT_ID = (process.env.PAYPRO_CLIENT_ID || "").trim();
-const PAYPRO_CLIENT_SECRET = (process.env.PAYPRO_CLIENT_SECRET || "").trim();
-
-const PAYPRO_MERCHANT_ID =
-  (process.env.PAYPRO_MERCHANT_ID || process.env.PAYPRO_USERNAME || "").trim();
-
-const PAYPRO_RETURN_URL =
-  process.env.PAYPRO_RETURN_URL || "http://localhost:8080/payment/success";
-const PAYPRO_CANCEL_URL =
-  process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel";
-
-// ✅ IMPORTANT: default auth path should be PayPro ppro family
-const PAYPRO_AUTH_PATH = (process.env.PAYPRO_AUTH_PATH || "/v2/ppro/auth").trim();
-const PAYPRO_CREATE_ORDER_PATH = (process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co").trim();
-
-// Callback creds (PayPro -> your API)
-const PAYPRO_CALLBACK_USERNAME =
-  (process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || "").trim();
-const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").trim();
-
-// ---- BREVO EMAIL API ENV (NO SMTP) ----
-const BREVO_API_KEY = (process.env.BREVO_API_KEY || "").trim();
-const RECEIPT_FROM_EMAIL = (process.env.RECEIPT_FROM_EMAIL || "").trim(); // e.g. help@secretsdiscounts.com
-const RECEIPT_FROM_NAME = (process.env.RECEIPT_FROM_NAME || "Secrets Discounts").trim();
-
-// ✅ behind proxies (Render etc.) helpful for IP/https detection
 app.set("trust proxy", 1);
 
 // ---- MIDDLEWARE ----
@@ -65,6 +37,34 @@ app.use(
 
 app.use(express.json({ limit: "2mb" }));
 
+// ---- PAYPRO ENV ----
+const PAYPRO_BASE_URL = (process.env.PAYPRO_BASE_URL || "").replace(/\/$/, ""); // e.g. https://api.paypro.com.pk
+const PAYPRO_CLIENT_ID = (process.env.PAYPRO_CLIENT_ID || "").trim();
+const PAYPRO_CLIENT_SECRET = (process.env.PAYPRO_CLIENT_SECRET || "").trim();
+
+const PAYPRO_MERCHANT_ID =
+  (process.env.PAYPRO_MERCHANT_ID || process.env.PAYPRO_USERNAME || "").trim();
+
+const PAYPRO_RETURN_URL =
+  process.env.PAYPRO_RETURN_URL || "http://localhost:8080/payment/success";
+const PAYPRO_CANCEL_URL =
+  process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel";
+
+// ✅ PayPro ppro family endpoints
+const PAYPRO_AUTH_PATH = (process.env.PAYPRO_AUTH_PATH || "/v2/ppro/auth").trim();
+const PAYPRO_CREATE_ORDER_PATH = (process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co").trim();
+
+// Callback creds (PayPro -> your API)
+const PAYPRO_CALLBACK_USERNAME =
+  (process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || "").trim();
+const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").trim();
+
+// ---- RESEND ENV ----
+const RESEND_API_KEY = (process.env.RESEND_API_KEY || "").trim();
+const RECEIPT_FROM_EMAIL = (process.env.RECEIPT_FROM_EMAIL || "").trim(); // e.g. help@secretsdiscounts.com
+const RECEIPT_FROM_NAME = (process.env.RECEIPT_FROM_NAME || "Secrets Discounts").trim();
+
+// ---- ROUTES ----
 app.get("/", (req, res) => res.send("PayPro backend running."));
 app.get("/health", (req, res) =>
   res.json({
@@ -72,12 +72,13 @@ app.get("/health", (req, res) =>
     service: "paypro-backend",
     port: PORT,
     allowedOrigins: FRONTEND_ORIGINS,
-    brevoConfigured: Boolean(BREVO_API_KEY && RECEIPT_FROM_EMAIL),
+    resendConfigured: Boolean(RESEND_API_KEY),
+    fromConfigured: Boolean(RECEIPT_FROM_EMAIL),
   })
 );
 
 // ---- HELPERS ----
-function requireEnvOrThrow() {
+function requirePayProEnvOrThrow() {
   const missing = [];
   if (!PAYPRO_BASE_URL) missing.push("PAYPRO_BASE_URL");
   if (!PAYPRO_CLIENT_ID) missing.push("PAYPRO_CLIENT_ID");
@@ -90,9 +91,9 @@ function requireEnvOrThrow() {
   }
 }
 
-function requireBrevoEnvOrThrow() {
+function requireResendEnvOrThrow() {
   const missing = [];
-  if (!BREVO_API_KEY) missing.push("BREVO_API_KEY");
+  if (!RESEND_API_KEY) missing.push("RESEND_API_KEY");
   if (!RECEIPT_FROM_EMAIL) missing.push("RECEIPT_FROM_EMAIL");
   if (missing.length) {
     const err = new Error(`Missing email env: ${missing.join(", ")}`);
@@ -208,32 +209,28 @@ function formatDDMMYYYY(d) {
   return `${dd}/${mm}/${yyyy}`;
 }
 
-// ---- BREVO EMAIL (HTTP API) ----
-async function sendReceiptEmail({ to, subject, html }) {
-  requireBrevoEnvOrThrow();
+// ---- RESEND EMAIL (HTTP API) ----
+async function sendEmailResend({ to, subject, html }) {
+  requireResendEnvOrThrow();
 
   const payload = {
-    sender: {
-      name: RECEIPT_FROM_NAME,
-      email: RECEIPT_FROM_EMAIL,
-    },
-    to: [{ email: to }],
+    from: `${RECEIPT_FROM_NAME} <${RECEIPT_FROM_EMAIL}>`,
+    to: Array.isArray(to) ? to : [to],
     subject,
-    htmlContent: html,
+    html,
   };
 
-  const r = await axios.post("https://api.brevo.com/v3/smtp/email", payload, {
+  const r = await axios.post("https://api.resend.com/emails", payload, {
     headers: {
-      "api-key": BREVO_API_KEY,
+      Authorization: `Bearer ${RESEND_API_KEY}`,
       "Content-Type": "application/json",
     },
     timeout: 20000,
     validateStatus: () => true,
   });
 
-  // If Brevo returns error details
   if (r.status < 200 || r.status >= 300) {
-    const msg = `Brevo error (${r.status}): ${stringifySafe(r.data).slice(0, 600)}`;
+    const msg = `Resend error (${r.status}): ${stringifySafe(r.data).slice(0, 800)}`;
     const err = new Error(msg);
     err.statusCode = 500;
     throw err;
@@ -242,23 +239,23 @@ async function sendReceiptEmail({ to, subject, html }) {
   return r.data;
 }
 
-// ✅ Test email route (Brevo API)
+// ✅ Test email route
 app.get("/api/test-email", async (req, res) => {
   try {
-    await sendReceiptEmail({
+    await sendEmailResend({
       to: RECEIPT_FROM_EMAIL,
-      subject: "Brevo API Test ✅",
-      html: "<h2>Email working via Brevo API 🎉</h2><p>This email is sent from Render without SMTP.</p>",
+      subject: "Resend Test ✅",
+      html: "<h2>Resend email working 🎉</h2><p>This email was sent from Render via Resend API.</p>",
     });
 
-    return res.json({ ok: true, message: "Email sent via Brevo API" });
+    return res.json({ ok: true, message: "Email sent via Resend" });
   } catch (e) {
     console.error("test-email error:", e?.message || e);
     return res.status(500).json({ ok: false, message: e?.message || "Email test failed" });
   }
 });
 
-// ✅ Receipt send endpoint (frontend ya callback ke baad call kar sakte ho)
+// ✅ Send receipt endpoint (frontend/callback dono use kar sakte ho)
 app.post("/api/send-receipt", async (req, res) => {
   try {
     const { customerEmail, customerName, orderId, amount, paymentMethod, items } = req.body || {};
@@ -274,14 +271,17 @@ app.post("/api/send-receipt", async (req, res) => {
     const itemsHtml =
       Array.isArray(items) && items.length
         ? `<ul>${items
-            .map((i) => `<li>${i?.name || "Item"} × ${i?.qty || 1} — Rs ${i?.price || ""}</li>`)
+            .map(
+              (i) =>
+                `<li>${i?.name || "Item"} × ${i?.qty || 1} — Rs ${i?.price ?? ""}</li>`
+            )
             .join("")}</ul>`
         : `<p>(Items not provided)</p>`;
 
     const html = `
       <div style="font-family: Arial, sans-serif; line-height: 1.6;">
         <h2 style="margin:0 0 8px;">Thanks for your order, ${safeName}!</h2>
-        <p style="margin:0 0 12px;">Your order receipt:</p>
+        <p style="margin:0 0 12px;">Your receipt:</p>
 
         <table cellpadding="6" style="border-collapse: collapse;">
           <tr><td><b>Order ID</b></td><td>${orderId}</td></tr>
@@ -293,11 +293,11 @@ app.post("/api/send-receipt", async (req, res) => {
         <h3 style="margin:0 0 8px;">Order Items</h3>
         ${itemsHtml}
 
-        <p style="margin-top:16px;">— Secrets Discounts</p>
+        <p style="margin-top:16px;">— ${RECEIPT_FROM_NAME}</p>
       </div>
     `;
 
-    await sendReceiptEmail({
+    await sendEmailResend({
       to: customerEmail,
       subject: `Order Receipt - ${orderId}`,
       html,
@@ -310,12 +310,10 @@ app.post("/api/send-receipt", async (req, res) => {
   }
 });
 
-// ---- AUTH (LIVE candidates) ----
-// /v2/ppro/auth family (safe)
+// ---- PAYPRO AUTH (LIVE candidates) ----
 async function getPayProToken() {
-  requireEnvOrThrow();
+  requirePayProEnvOrThrow();
 
-  // casing safe (kabhi API strict hoti hai)
   const payload = {
     clientid: PAYPRO_CLIENT_ID,
     clientsecret: PAYPRO_CLIENT_SECRET,
@@ -323,7 +321,6 @@ async function getPayProToken() {
     ClientSecret: PAYPRO_CLIENT_SECRET,
   };
 
-  // base variants: api + www.api
   const baseCandidates = [
     PAYPRO_BASE_URL,
     PAYPRO_BASE_URL.includes("://www.")
@@ -331,13 +328,8 @@ async function getPayProToken() {
       : PAYPRO_BASE_URL.replace("://", "://www."),
   ].filter(Boolean);
 
-  // path candidates: only ppro family (safe)
   const pathCandidates = Array.from(
-    new Set([
-      PAYPRO_AUTH_PATH || "/v2/ppro/auth",
-      "/v2/ppro/auth",
-      "/ppro/auth",
-    ])
+    new Set([PAYPRO_AUTH_PATH || "/v2/ppro/auth", "/v2/ppro/auth", "/ppro/auth"])
   );
 
   let lastErr = null;
@@ -357,25 +349,21 @@ async function getPayProToken() {
       console.log("PayPro AUTH content-type:", r.headers?.["content-type"]);
       console.log("PayPro AUTH body preview:", stringifySafe(r.data).slice(0, 250));
 
-      // HTML means wrong route
       if (isHtmlResponse(r.headers, r.data)) {
         lastErr = `Auth returned HTML on ${authUrl}`;
         continue;
       }
 
-      // If PayPro returns plain text "InValid Keys"
       if (looksLikeInvalidKeys(r.data)) {
-        lastErr = `Auth says "InValid Keys" on ${authUrl}. (Keys not accepted for this environment.)`;
+        lastErr = `Auth says "InValid Keys" on ${authUrl}.`;
         continue;
       }
 
-      // Non-2xx
       if (r.status < 200 || r.status >= 300) {
         lastErr = `Auth failed (${r.status}) on ${authUrl}: ${stringifySafe(r.data).slice(0, 200)}`;
         continue;
       }
 
-      // Try to extract token
       const token = detectTokenFromHeaders(r.headers) || detectTokenFromBody(r.data);
       if (!token) {
         lastErr = `Auth OK but token missing on ${authUrl}`;
@@ -398,7 +386,7 @@ async function getPayProToken() {
 // ---- INITIATE (Create Order / CO) ----
 app.post("/api/paypro/initiate", async (req, res) => {
   try {
-    requireEnvOrThrow();
+    requirePayProEnvOrThrow();
 
     const { orderId, amount, customer, description } = req.body || {};
     if (!orderId) {
@@ -439,7 +427,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
     const r = await axios.post(coUrl, coPayload, {
       headers: {
         "Content-Type": "application/json",
-        Token: token, // ✅ only Token
+        Token: token,
       },
       timeout: 20000,
       validateStatus: () => true,
@@ -524,9 +512,9 @@ app.post("/paypro/uis", async (req, res) => {
       .map((s) => s.trim())
       .filter(Boolean);
 
-    // TODO: yahan apne DB/Firestore me order paid mark karo
-    // NOTE: Receipt email trigger karna ho to yahan DB se customer email lookup karke
-    // sendReceiptEmail() call kar sakte ho.
+    // ✅ OPTIONAL: If you store orderId->customerEmail somewhere,
+    // you can lookup and send receipt here using sendEmailResend().
+    // For now, we just acknowledge payment.
 
     const response = ids.map((id) => ({
       StatusCode: "00",
