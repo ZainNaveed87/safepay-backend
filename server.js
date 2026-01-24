@@ -4,41 +4,55 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 
-const app = express();
+// -------------------- OPTIONAL: Firebase Admin (for order lookup + paid update) --------------------
+// Receipt automatic bhejne ke liye backend ko customer email chahiye.
+// PayPro callback me email nahi aata, is liye hum orderId -> customerEmail ko Firestore me store/read karte hain.
+// Agar tum firebase-admin setup nahi karna chahte, to bhi PayPro work karega, lekin auto receipt nahi jaegi.
 
-// ✅ Render sets PORT automatically. Keep fallback for local dev.
+let admin = null;
+let firestore = null;
+
+async function initFirebaseAdminIfPossible() {
+  if (firestore) return firestore;
+
+  const svcJson = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
+  if (!svcJson) return null;
+
+  try {
+    // dynamic import so app doesn't crash if dependency missing
+    const mod = await import("firebase-admin");
+    admin = mod.default || mod;
+
+    if (!admin.apps?.length) {
+      const creds = JSON.parse(svcJson);
+
+      admin.initializeApp({
+        credential: admin.credential.cert(creds),
+      });
+    }
+
+    firestore = admin.firestore();
+    return firestore;
+  } catch (e) {
+    console.log("⚠️ Firebase admin init failed:", e?.message || e);
+    return null;
+  }
+}
+
+// -------------------- App --------------------
+const app = express();
+app.set("trust proxy", 1);
+
 const PORT = Number(process.env.PORT || 5050);
 
-// ✅ Allow multiple origins (comma-separated) for local + production
-// Example env:
-// FRONTEND_ORIGIN=https://secretsdiscounts.com,http://localhost:8080
 const FRONTEND_ORIGINS_RAW =
   process.env.FRONTEND_ORIGIN || "http://localhost:8080";
 const FRONTEND_ORIGINS = FRONTEND_ORIGINS_RAW.split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-app.set("trust proxy", 1);
-
-// ---- MIDDLEWARE ----
-app.use(
-  cors({
-    origin: function (origin, cb) {
-      // allow server-to-server requests (no Origin), Postman, PayPro etc.
-      if (!origin) return cb(null, true);
-
-      if (FRONTEND_ORIGINS.includes(origin)) return cb(null, true);
-
-      return cb(new Error(`CORS blocked for origin: ${origin}`), false);
-    },
-    credentials: true,
-  })
-);
-
-app.use(express.json({ limit: "2mb" }));
-
-// ---- PAYPRO ENV ----
-const PAYPRO_BASE_URL = (process.env.PAYPRO_BASE_URL || "").replace(/\/$/, ""); // e.g. https://api.paypro.com.pk
+// ---- PayPro ENV ----
+const PAYPRO_BASE_URL = (process.env.PAYPRO_BASE_URL || "").replace(/\/$/, "");
 const PAYPRO_CLIENT_ID = (process.env.PAYPRO_CLIENT_ID || "").trim();
 const PAYPRO_CLIENT_SECRET = (process.env.PAYPRO_CLIENT_SECRET || "").trim();
 
@@ -50,35 +64,35 @@ const PAYPRO_RETURN_URL =
 const PAYPRO_CANCEL_URL =
   process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel";
 
-// ✅ PayPro ppro family endpoints
 const PAYPRO_AUTH_PATH = (process.env.PAYPRO_AUTH_PATH || "/v2/ppro/auth").trim();
 const PAYPRO_CREATE_ORDER_PATH = (process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co").trim();
 
-// Callback creds (PayPro -> your API)
+// PayPro -> your callback creds (panel me same lagao)
 const PAYPRO_CALLBACK_USERNAME =
   (process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || "").trim();
 const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").trim();
 
-// ---- RESEND ENV ----
+// ---- Email ENV (Resend) ----
 const RESEND_API_KEY = (process.env.RESEND_API_KEY || "").trim();
-const RECEIPT_FROM_EMAIL = (process.env.RECEIPT_FROM_EMAIL || "").trim(); // e.g. help@secretsdiscounts.com
+const RECEIPT_FROM_EMAIL = (process.env.RECEIPT_FROM_EMAIL || "").trim();
 const RECEIPT_FROM_NAME = (process.env.RECEIPT_FROM_NAME || "Secrets Discounts").trim();
 
-// ---- ROUTES ----
-app.get("/", (req, res) => res.send("PayPro backend running."));
-app.get("/health", (req, res) =>
-  res.json({
-    ok: true,
-    service: "paypro-backend",
-    port: PORT,
-    allowedOrigins: FRONTEND_ORIGINS,
-    resendConfigured: Boolean(RESEND_API_KEY),
-    fromConfigured: Boolean(RECEIPT_FROM_EMAIL),
+// -------------------- Middleware --------------------
+app.use(
+  cors({
+    origin: function (origin, cb) {
+      if (!origin) return cb(null, true); // server-to-server / Postman
+      if (FRONTEND_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error(`CORS blocked for origin: ${origin}`), false);
+    },
+    credentials: true,
   })
 );
 
-// ---- HELPERS ----
-function requirePayProEnvOrThrow() {
+app.use(express.json({ limit: "2mb" }));
+
+// -------------------- Utils --------------------
+function requireEnvOrThrow() {
   const missing = [];
   if (!PAYPRO_BASE_URL) missing.push("PAYPRO_BASE_URL");
   if (!PAYPRO_CLIENT_ID) missing.push("PAYPRO_CLIENT_ID");
@@ -86,17 +100,6 @@ function requirePayProEnvOrThrow() {
   if (!PAYPRO_MERCHANT_ID) missing.push("PAYPRO_MERCHANT_ID (or PAYPRO_USERNAME)");
   if (missing.length) {
     const err = new Error(`Missing env: ${missing.join(", ")}`);
-    err.statusCode = 500;
-    throw err;
-  }
-}
-
-function requireResendEnvOrThrow() {
-  const missing = [];
-  if (!RESEND_API_KEY) missing.push("RESEND_API_KEY");
-  if (!RECEIPT_FROM_EMAIL) missing.push("RECEIPT_FROM_EMAIL");
-  if (missing.length) {
-    const err = new Error(`Missing email env: ${missing.join(", ")}`);
     err.statusCode = 500;
     throw err;
   }
@@ -136,8 +139,7 @@ function looksLikeInvalidKeys(body) {
 
 function detectTokenFromHeaders(headers) {
   if (!headers) return null;
-
-  const direct =
+  return (
     headers["token"] ||
     headers["Token"] ||
     headers["TOKEN"] ||
@@ -147,22 +149,8 @@ function detectTokenFromHeaders(headers) {
     headers["X-Auth-Token"] ||
     headers["access-token"] ||
     headers["Access-Token"] ||
-    null;
-
-  if (direct) return direct;
-
-  for (const [k, v] of Object.entries(headers)) {
-    const key = String(k || "").toLowerCase();
-    if (
-      key === "token" ||
-      key === "x-token" ||
-      key === "x-auth-token" ||
-      key === "access-token"
-    ) {
-      return v;
-    }
-  }
-  return null;
+    null
+  );
 }
 
 function detectTokenFromBody(data) {
@@ -209,13 +197,24 @@ function formatDDMMYYYY(d) {
   return `${dd}/${mm}/${yyyy}`;
 }
 
-// ---- RESEND EMAIL (HTTP API) ----
-async function sendEmailResend({ to, subject, html }) {
-  requireResendEnvOrThrow();
+function isEmailValid(email) {
+  const e = String(email || "").trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+}
+
+// -------------------- Resend Helpers --------------------
+async function sendReceiptEmailResend({ to, subject, html }) {
+  if (!RESEND_API_KEY) throw new Error("RESEND_API_KEY missing");
+  if (!RECEIPT_FROM_EMAIL) throw new Error("RECEIPT_FROM_EMAIL missing");
+
+  const from =
+    RECEIPT_FROM_NAME && RECEIPT_FROM_NAME.trim()
+      ? `${RECEIPT_FROM_NAME} <${RECEIPT_FROM_EMAIL}>`
+      : RECEIPT_FROM_EMAIL;
 
   const payload = {
-    from: `${RECEIPT_FROM_NAME} <${RECEIPT_FROM_EMAIL}>`,
-    to: Array.isArray(to) ? to : [to],
+    from,
+    to,
     subject,
     html,
   };
@@ -230,89 +229,42 @@ async function sendEmailResend({ to, subject, html }) {
   });
 
   if (r.status < 200 || r.status >= 300) {
-    const msg = `Resend error (${r.status}): ${stringifySafe(r.data).slice(0, 800)}`;
-    const err = new Error(msg);
-    err.statusCode = 500;
-    throw err;
+    throw new Error(`Resend error (${r.status}): ${stringifySafe(r.data)}`);
   }
 
   return r.data;
 }
 
-// ✅ Test email route
-app.get("/api/test-email", async (req, res) => {
-  try {
-    await sendEmailResend({
-      to: RECEIPT_FROM_EMAIL,
-      subject: "Resend Test ✅",
-      html: "<h2>Resend email working 🎉</h2><p>This email was sent from Render via Resend API.</p>",
-    });
+function buildReceiptHtml({ orderId, amount, customerName, customerEmail }) {
+  const safeName = customerName ? String(customerName) : "Customer";
+  const safeEmail = customerEmail ? String(customerEmail) : "";
+  const safeAmount = Number(amount || 0);
 
-    return res.json({ ok: true, message: "Email sent via Resend" });
-  } catch (e) {
-    console.error("test-email error:", e?.message || e);
-    return res.status(500).json({ ok: false, message: e?.message || "Email test failed" });
-  }
-});
+  return `
+  <div style="font-family: Arial, sans-serif; padding:16px; color:#111">
+    <h2 style="margin:0 0 8px">Payment Successful ✅</h2>
+    <p style="margin:0 0 12px">Hi <b>${safeName}</b>, thanks for your order!</p>
 
-// ✅ Send receipt endpoint (frontend/callback dono use kar sakte ho)
-app.post("/api/send-receipt", async (req, res) => {
-  try {
-    const { customerEmail, customerName, orderId, amount, paymentMethod, items } = req.body || {};
+    <div style="border:1px solid #e5e7eb; border-radius:12px; padding:12px; background:#fafafa">
+      <p style="margin:0 0 6px"><b>Order ID:</b> ${orderId}</p>
+      <p style="margin:0 0 6px"><b>Paid Amount:</b> Rs ${safeAmount.toFixed(0)}</p>
+      ${safeEmail ? `<p style="margin:0"><b>Email:</b> ${safeEmail}</p>` : ""}
+    </div>
 
-    if (!customerEmail || !orderId) {
-      return res.status(400).json({ ok: false, message: "customerEmail & orderId required" });
-    }
+    <p style="margin:12px 0 0; color:#444">
+      If you have any questions, reply to this email.
+    </p>
 
-    const safeName = customerName || "Customer";
-    const safeMethod = paymentMethod || "Online";
-    const safeAmount = amount ?? "";
+    <p style="margin:18px 0 0; font-size:12px; color:#777">
+      © ${new Date().getFullYear()} Secrets Discounts
+    </p>
+  </div>
+  `;
+}
 
-    const itemsHtml =
-      Array.isArray(items) && items.length
-        ? `<ul>${items
-            .map(
-              (i) =>
-                `<li>${i?.name || "Item"} × ${i?.qty || 1} — Rs ${i?.price ?? ""}</li>`
-            )
-            .join("")}</ul>`
-        : `<p>(Items not provided)</p>`;
-
-    const html = `
-      <div style="font-family: Arial, sans-serif; line-height: 1.6;">
-        <h2 style="margin:0 0 8px;">Thanks for your order, ${safeName}!</h2>
-        <p style="margin:0 0 12px;">Your receipt:</p>
-
-        <table cellpadding="6" style="border-collapse: collapse;">
-          <tr><td><b>Order ID</b></td><td>${orderId}</td></tr>
-          <tr><td><b>Amount</b></td><td>Rs ${safeAmount}</td></tr>
-          <tr><td><b>Payment</b></td><td>${safeMethod}</td></tr>
-        </table>
-
-        <hr style="margin:16px 0;" />
-        <h3 style="margin:0 0 8px;">Order Items</h3>
-        ${itemsHtml}
-
-        <p style="margin-top:16px;">— ${RECEIPT_FROM_NAME}</p>
-      </div>
-    `;
-
-    await sendEmailResend({
-      to: customerEmail,
-      subject: `Order Receipt - ${orderId}`,
-      html,
-    });
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("send-receipt error:", e?.message || e);
-    return res.status(500).json({ ok: false, message: e?.message || "Failed to send receipt" });
-  }
-});
-
-// ---- PAYPRO AUTH (LIVE candidates) ----
+// -------------------- PayPro AUTH --------------------
 async function getPayProToken() {
-  requirePayProEnvOrThrow();
+  requireEnvOrThrow();
 
   const payload = {
     clientid: PAYPRO_CLIENT_ID,
@@ -375,18 +327,66 @@ async function getPayProToken() {
     }
   }
 
-  const err = new Error(
-    lastErr ||
-      "Auth failed on all candidates. Check PAYPRO_BASE_URL and confirm LIVE auth endpoint from PayPro."
-  );
+  const err = new Error(lastErr || "Auth failed on all candidates.");
   err.statusCode = 500;
   throw err;
 }
 
-// ---- INITIATE (Create Order / CO) ----
+// -------------------- Routes --------------------
+app.get("/", (req, res) => res.send("PayPro backend running."));
+app.get("/health", (req, res) =>
+  res.json({
+    ok: true,
+    service: "paypro-backend",
+    port: PORT,
+    allowedOrigins: FRONTEND_ORIGINS,
+    hasResend: Boolean(RESEND_API_KEY),
+    fromEmail: RECEIPT_FROM_EMAIL || null,
+    firebaseConfigured: Boolean((process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim()),
+  })
+);
+
+// ✅ GET route sirf testing ke liye (browser me open kar lo)
+app.get("/paypro/uis", (req, res) => {
+  res.json({
+    ok: true,
+    message:
+      "This is PayPro UIS endpoint. PayPro will POST here. (GET is only for testing.)",
+  });
+});
+
+// ✅ Test email (Resend)
+app.get("/api/test-email", async (req, res) => {
+  try {
+    const to = String(req.query.to || "").trim() || RECEIPT_FROM_EMAIL;
+
+    if (!isEmailValid(to)) {
+      return res.status(400).json({ ok: false, message: "Invalid ?to=email" });
+    }
+
+    await sendReceiptEmailResend({
+      to,
+      subject: "Test Email - Secrets Discounts",
+      html: buildReceiptHtml({
+        orderId: `TEST-${Date.now()}`,
+        amount: 100,
+        customerName: "Test Customer",
+        customerEmail: to,
+      }),
+    });
+
+    return res.json({ ok: true, message: "Email sent via Resend" });
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ ok: false, message: e?.message || "Server error" });
+  }
+});
+
+// ✅ Create Order (CO) + (optional) store order mapping for callback receipt
 app.post("/api/paypro/initiate", async (req, res) => {
   try {
-    requirePayProEnvOrThrow();
+    requireEnvOrThrow();
 
     const { orderId, amount, customer, description } = req.body || {};
     if (!orderId) {
@@ -397,6 +397,9 @@ app.post("/api/paypro/initiate", async (req, res) => {
     if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
       return res.status(400).json({ ok: false, message: "amount must be > 0" });
     }
+
+    const customerEmail = String(customer?.email || "").trim();
+    const customerName = String(customer?.fullName || customer?.name || "Customer").trim();
 
     const token = await getPayProToken();
 
@@ -413,10 +416,10 @@ app.post("/api/paypro/initiate", async (req, res) => {
         OrderType: "Service",
         IssueDate: formatDDMMYYYY(now),
         OrderExpireAfterSeconds: "0",
-        CustomerName: customer?.fullName || customer?.name || "Customer",
-        CustomerMobile: customer?.phone || "",
-        CustomerEmail: customer?.email || "",
-        CustomerAddress: customer?.address || description || "",
+        CustomerName: customerName || "Customer",
+        CustomerMobile: String(customer?.phone || ""),
+        CustomerEmail: customerEmail || "",
+        CustomerAddress: String(customer?.address || description || ""),
         ReturnURL: PAYPRO_RETURN_URL,
         CancelURL: PAYPRO_CANCEL_URL,
       },
@@ -441,7 +444,8 @@ app.post("/api/paypro/initiate", async (req, res) => {
     if (isHtmlResponse(r.headers, r.data)) {
       return res.status(500).json({
         ok: false,
-        message: "CO returned HTML (wrong route). Check PAYPRO_CREATE_ORDER_PATH / BASE_URL.",
+        message:
+          "CO returned HTML (wrong route). Check PAYPRO_CREATE_ORDER_PATH / BASE_URL.",
         raw: String(r.data).slice(0, 500),
       });
     }
@@ -455,6 +459,36 @@ app.post("/api/paypro/initiate", async (req, res) => {
     }
 
     const redirectUrl = detectRedirectUrl(r.data);
+
+    // ✅ OPTIONAL: store mapping orderId -> email/name/amount for callback receipt
+    // This enables automatic receipt on /paypro/uis.
+    try {
+      const fs = await initFirebaseAdminIfPossible();
+      if (fs && isEmailValid(customerEmail)) {
+        await fs
+          .collection("paypro_orders")
+          .doc(String(orderId))
+          .set(
+            {
+              orderId: String(orderId),
+              email: customerEmail,
+              name: customerName || "Customer",
+              amount: Math.round(numericAmount),
+              createdAt: new Date().toISOString(),
+              status: "initiated",
+              gateway: "paypro",
+              redirectUrl: redirectUrl || null,
+            },
+            { merge: true }
+          );
+      } else {
+        console.log(
+          "⚠️ Firestore not configured or customer email missing; receipt auto-send may not work."
+        );
+      }
+    } catch (e) {
+      console.log("⚠️ Firestore store mapping failed:", e?.message || e);
+    }
 
     return res.status(200).json({
       ok: true,
@@ -470,9 +504,9 @@ app.post("/api/paypro/initiate", async (req, res) => {
   }
 });
 
-// ---- CALLBACK (PayPro -> Your API) ----
-// ✅ Put THIS URL in PayPro panel UIS/Callback:
-// https://YOUR-RENDER-DOMAIN/paypro/uis
+// ✅ PayPro callback (PayPro -> Your API)
+// PayPro panel me callback URL yeh do:
+// https://paypro-backend.onrender.com/paypro/uis
 app.post("/paypro/uis", async (req, res) => {
   try {
     const { username, password, csvinvoiceids } = req.body || {};
@@ -487,7 +521,7 @@ app.post("/paypro/uis", async (req, res) => {
       ]);
     }
 
-    // verify callback creds (recommended)
+    // verify callback creds
     if (PAYPRO_CALLBACK_USERNAME && username !== PAYPRO_CALLBACK_USERNAME) {
       return res.status(401).json([
         {
@@ -512,10 +546,73 @@ app.post("/paypro/uis", async (req, res) => {
       .map((s) => s.trim())
       .filter(Boolean);
 
-    // ✅ OPTIONAL: If you store orderId->customerEmail somewhere,
-    // you can lookup and send receipt here using sendEmailResend().
-    // For now, we just acknowledge payment.
+    // ✅ For each paid invoiceId:
+    // 1) Firestore mapping lookup (paypro_orders/{orderId})
+    // 2) Update status to paid
+    // 3) Send receipt email via Resend
 
+    const fs = await initFirebaseAdminIfPossible();
+
+    for (const orderId of ids) {
+      let email = "";
+      let name = "Customer";
+      let amount = 0;
+
+      if (fs) {
+        try {
+          const snap = await fs.collection("paypro_orders").doc(String(orderId)).get();
+          if (snap.exists) {
+            const data = snap.data() || {};
+            email = String(data.email || "").trim();
+            name = String(data.name || "Customer").trim();
+            amount = Number(data.amount || 0) || 0;
+
+            // mark paid
+            await fs
+              .collection("paypro_orders")
+              .doc(String(orderId))
+              .set(
+                {
+                  status: "paid",
+                  paidAt: new Date().toISOString(),
+                  updatedAt: new Date().toISOString(),
+                },
+                { merge: true }
+              );
+          } else {
+            console.log("⚠️ paypro_orders mapping not found for:", orderId);
+          }
+        } catch (e) {
+          console.log("⚠️ Firestore lookup/update failed:", orderId, e?.message || e);
+        }
+      }
+
+      // Send receipt if we have email
+      if (isEmailValid(email)) {
+        try {
+          await sendReceiptEmailResend({
+            to: email,
+            subject: `Receipt - Order ${orderId} (Paid)`,
+            html: buildReceiptHtml({
+              orderId,
+              amount: amount || 0,
+              customerName: name || "Customer",
+              customerEmail: email,
+            }),
+          });
+
+          console.log("✅ Receipt sent:", orderId, "->", email);
+        } catch (e) {
+          console.log("⚠️ Receipt send failed:", orderId, e?.message || e);
+        }
+      } else {
+        console.log(
+          "⚠️ No valid email for receipt on callback. Configure Firestore mapping (FIREBASE_SERVICE_ACCOUNT_JSON) OR store mapping elsewhere."
+        );
+      }
+    }
+
+    // PayPro expects array response per invoice id
     const response = ids.map((id) => ({
       StatusCode: "00",
       InvoiceID: id,
@@ -523,7 +620,7 @@ app.post("/paypro/uis", async (req, res) => {
     }));
 
     return res.status(200).json(response);
-  } catch {
+  } catch (e) {
     return res.status(500).json([
       { StatusCode: "02", InvoiceID: null, Description: "Service Failure" },
     ]);
