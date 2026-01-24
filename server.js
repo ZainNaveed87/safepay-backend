@@ -6,8 +6,8 @@ import axios from "axios";
 
 // -------------------- OPTIONAL: Firebase Admin (for order lookup + paid update) --------------------
 // Receipt automatic bhejne ke liye backend ko customer email chahiye.
-// PayPro callback me email nahi aata, is liye hum orderId -> customerEmail ko Firestore me store/read karte hain.
-// Agar tum firebase-admin setup nahi karna chahte, to bhi PayPro work karega, lekin auto receipt nahi jaegi.
+// PayPro callback me email nahi aata, is liye hum orderId -> customerEmail mapping store/read karte hain.
+// Agar firebase-admin setup nahi karna, PayPro flow chalega, lekin auto receipt nahi jaegi.
 
 let admin = null;
 let firestore = null;
@@ -212,12 +212,7 @@ async function sendReceiptEmailResend({ to, subject, html }) {
       ? `${RECEIPT_FROM_NAME} <${RECEIPT_FROM_EMAIL}>`
       : RECEIPT_FROM_EMAIL;
 
-  const payload = {
-    from,
-    to,
-    subject,
-    html,
-  };
+  const payload = { from, to, subject, html };
 
   const r = await axios.post("https://api.resend.com/emails", payload, {
     headers: {
@@ -334,6 +329,7 @@ async function getPayProToken() {
 
 // -------------------- Routes --------------------
 app.get("/", (req, res) => res.send("PayPro backend running."));
+
 app.get("/health", (req, res) =>
   res.json({
     ok: true,
@@ -377,9 +373,7 @@ app.get("/api/test-email", async (req, res) => {
 
     return res.json({ ok: true, message: "Email sent via Resend" });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ ok: false, message: e?.message || "Server error" });
+    return res.status(500).json({ ok: false, message: e?.message || "Server error" });
   }
 });
 
@@ -444,8 +438,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
     if (isHtmlResponse(r.headers, r.data)) {
       return res.status(500).json({
         ok: false,
-        message:
-          "CO returned HTML (wrong route). Check PAYPRO_CREATE_ORDER_PATH / BASE_URL.",
+        message: "CO returned HTML (wrong route). Check PAYPRO_CREATE_ORDER_PATH / BASE_URL.",
         raw: String(r.data).slice(0, 500),
       });
     }
@@ -461,30 +454,24 @@ app.post("/api/paypro/initiate", async (req, res) => {
     const redirectUrl = detectRedirectUrl(r.data);
 
     // ✅ OPTIONAL: store mapping orderId -> email/name/amount for callback receipt
-    // This enables automatic receipt on /paypro/uis.
     try {
       const fs = await initFirebaseAdminIfPossible();
       if (fs && isEmailValid(customerEmail)) {
-        await fs
-          .collection("paypro_orders")
-          .doc(String(orderId))
-          .set(
-            {
-              orderId: String(orderId),
-              email: customerEmail,
-              name: customerName || "Customer",
-              amount: Math.round(numericAmount),
-              createdAt: new Date().toISOString(),
-              status: "initiated",
-              gateway: "paypro",
-              redirectUrl: redirectUrl || null,
-            },
-            { merge: true }
-          );
-      } else {
-        console.log(
-          "⚠️ Firestore not configured or customer email missing; receipt auto-send may not work."
+        await fs.collection("paypro_orders").doc(String(orderId)).set(
+          {
+            orderId: String(orderId),
+            email: customerEmail,
+            name: customerName || "Customer",
+            amount: Math.round(numericAmount),
+            createdAt: new Date().toISOString(),
+            status: "initiated",
+            gateway: "paypro",
+            redirectUrl: redirectUrl || null,
+          },
+          { merge: true }
         );
+      } else {
+        console.log("⚠️ Firestore not configured or customer email missing; receipt auto-send may not work.");
       }
     } catch (e) {
       console.log("⚠️ Firestore store mapping failed:", e?.message || e);
@@ -513,31 +500,19 @@ app.post("/paypro/uis", async (req, res) => {
 
     if (!username || !password || !csvinvoiceids) {
       return res.status(400).json([
-        {
-          StatusCode: "01",
-          InvoiceID: null,
-          Description: "Invalid Data. Username/password/csvinvoiceids missing",
-        },
+        { StatusCode: "01", InvoiceID: null, Description: "Invalid Data. Username/password/csvinvoiceids missing" },
       ]);
     }
 
     // verify callback creds
     if (PAYPRO_CALLBACK_USERNAME && username !== PAYPRO_CALLBACK_USERNAME) {
       return res.status(401).json([
-        {
-          StatusCode: "01",
-          InvoiceID: null,
-          Description: "Invalid Data. Username or password is invalid",
-        },
+        { StatusCode: "01", InvoiceID: null, Description: "Invalid Data. Username or password is invalid" },
       ]);
     }
     if (PAYPRO_CALLBACK_PASSWORD && password !== PAYPRO_CALLBACK_PASSWORD) {
       return res.status(401).json([
-        {
-          StatusCode: "01",
-          InvoiceID: null,
-          Description: "Invalid Data. Username or password is invalid",
-        },
+        { StatusCode: "01", InvoiceID: null, Description: "Invalid Data. Username or password is invalid" },
       ]);
     }
 
@@ -545,11 +520,6 @@ app.post("/paypro/uis", async (req, res) => {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
-
-    // ✅ For each paid invoiceId:
-    // 1) Firestore mapping lookup (paypro_orders/{orderId})
-    // 2) Update status to paid
-    // 3) Send receipt email via Resend
 
     const fs = await initFirebaseAdminIfPossible();
 
@@ -568,17 +538,14 @@ app.post("/paypro/uis", async (req, res) => {
             amount = Number(data.amount || 0) || 0;
 
             // mark paid
-            await fs
-              .collection("paypro_orders")
-              .doc(String(orderId))
-              .set(
-                {
-                  status: "paid",
-                  paidAt: new Date().toISOString(),
-                  updatedAt: new Date().toISOString(),
-                },
-                { merge: true }
-              );
+            await fs.collection("paypro_orders").doc(String(orderId)).set(
+              {
+                status: "paid",
+                paidAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              },
+              { merge: true }
+            );
           } else {
             console.log("⚠️ paypro_orders mapping not found for:", orderId);
           }
@@ -612,7 +579,6 @@ app.post("/paypro/uis", async (req, res) => {
       }
     }
 
-    // PayPro expects array response per invoice id
     const response = ids.map((id) => ({
       StatusCode: "00",
       InvoiceID: id,
