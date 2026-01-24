@@ -32,7 +32,8 @@ app.set("trust proxy", 1);
 
 const PORT = Number(process.env.PORT || 5050);
 
-const FRONTEND_ORIGINS_RAW = process.env.FRONTEND_ORIGIN || "http://localhost:8080";
+const FRONTEND_ORIGINS_RAW =
+  process.env.FRONTEND_ORIGIN || "http://localhost:8080";
 const FRONTEND_ORIGINS = FRONTEND_ORIGINS_RAW.split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -42,20 +43,28 @@ const PAYPRO_BASE_URL = (process.env.PAYPRO_BASE_URL || "").replace(/\/$/, "");
 const PAYPRO_CLIENT_ID = (process.env.PAYPRO_CLIENT_ID || "").trim();
 const PAYPRO_CLIENT_SECRET = (process.env.PAYPRO_CLIENT_SECRET || "").trim();
 
-const PAYPRO_MERCHANT_ID =
-  (process.env.PAYPRO_MERCHANT_ID || process.env.PAYPRO_USERNAME || "").trim();
+const PAYPRO_MERCHANT_ID = (
+  process.env.PAYPRO_MERCHANT_ID ||
+  process.env.PAYPRO_USERNAME ||
+  ""
+).trim();
 
 const PAYPRO_RETURN_URL =
-  process.env.PAYPRO_RETURN_URL || "http://localhost:8080/payment/success";
+  process.env.PAYPRO_RETURN_URL ||
+  "http://localhost:8080/payment/success";
 const PAYPRO_CANCEL_URL =
-  process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel";
+  process.env.PAYPRO_CANCEL_URL ||
+  "http://localhost:8080/payment/cancel";
 
 const PAYPRO_AUTH_PATH = (process.env.PAYPRO_AUTH_PATH || "/v2/ppro/auth").trim();
 const PAYPRO_CREATE_ORDER_PATH = (process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co").trim();
 
 // PayPro callback creds
-const PAYPRO_CALLBACK_USERNAME =
-  (process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || "").trim();
+const PAYPRO_CALLBACK_USERNAME = (
+  process.env.PAYPRO_CALLBACK_USERNAME ||
+  process.env.PAYPRO_USERNAME ||
+  ""
+).trim();
 const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").trim();
 
 // ---- Resend ENV ----
@@ -63,12 +72,13 @@ const RESEND_API_KEY = (process.env.RESEND_API_KEY || "").trim();
 const RECEIPT_FROM_EMAIL = (process.env.RECEIPT_FROM_EMAIL || "").trim();
 const RECEIPT_FROM_NAME = (process.env.RECEIPT_FROM_NAME || "Secrets Discounts").trim();
 
-// ---- Receipt Branding (OPTIONAL) ----
-const RECEIPT_LOGO_URL = (process.env.RECEIPT_LOGO_URL || "").trim(); // public https image url
-const SUPPORT_EMAIL = (process.env.SUPPORT_EMAIL || RECEIPT_FROM_EMAIL || "").trim();
-const SITE_URL = (process.env.SITE_URL || "https://secretsdiscounts.com").trim();
-const BRAND_PRIMARY = (process.env.BRAND_PRIMARY || "#2563eb").trim(); // blue
-const BRAND_ACCENT = (process.env.BRAND_ACCENT || "#22c55e").trim(); // green
+// ✅ Logo / Brand
+const RECEIPT_LOGO_URL = (process.env.RECEIPT_LOGO_URL || "").trim(); // put your logo url here
+const RECEIPT_BRAND_COLOR = (process.env.RECEIPT_BRAND_COLOR || "#2563eb").trim(); // default blue
+
+// Optional deliverability helpers
+const RECEIPT_REPLY_TO = (process.env.RECEIPT_REPLY_TO || "").trim(); // e.g. support@yourdomain.com
+const RECEIPT_BCC = (process.env.RECEIPT_BCC || "").trim(); // e.g. your accounting email
 
 // -------------------- Middleware --------------------
 app.use(
@@ -161,7 +171,6 @@ function detectTokenFromBody(data) {
 
 function detectRedirectUrl(data) {
   if (!data) return null;
-
   if (Array.isArray(data)) {
     for (const item of data) {
       const u = detectRedirectUrl(item);
@@ -169,7 +178,6 @@ function detectRedirectUrl(data) {
     }
     return null;
   }
-
   return (
     data.Click2Pay ||
     data.short_Click2Pay ||
@@ -212,354 +220,65 @@ function makePayproAck(ids, ok = true, descOk = "Invoice successfully marked as 
 }
 
 function escapeHtml(str) {
-  const s = String(str ?? "");
-  return s
+  return String(str ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+    .replaceAll("'", "&#39;");
 }
 
-function moneyPKR(n) {
+function money(n) {
   const x = Number(n || 0);
-  if (!Number.isFinite(x)) return "Rs0";
-  // Email receipts often look best without long decimals
-  return `Rs ${x.toFixed(0)}`;
+  if (!Number.isFinite(x)) return "0";
+  return x.toFixed(0);
 }
 
-function safeDateLabel(iso) {
-  try {
-    const d = iso ? new Date(iso) : new Date();
-    if (Number.isNaN(d.getTime())) return new Date().toLocaleString();
-    return d.toLocaleString();
-  } catch {
-    return new Date().toLocaleString();
-  }
+function normalizeItems(items) {
+  const arr = Array.isArray(items) ? items : [];
+  return arr
+    .map((it) => ({
+      name: it?.name ?? it?.title ?? "",
+      image: it?.image ?? it?.img ?? "",
+      price: Number(it?.price ?? 0) || 0,
+      quantity: Number(it?.quantity ?? 1) || 1,
+      variant: it?.variant ?? null,
+    }))
+    .filter((x) => x.name || x.image);
 }
 
-function normalizeVariantText(variant) {
-  if (!variant || typeof variant !== "object") return "";
-  const parts = [];
-  if (variant.color) parts.push(`Color: ${variant.color}`);
-  if (variant.size) parts.push(`Size: ${variant.size}`);
-  if (variant.sku) parts.push(`SKU: ${variant.sku}`);
-  // include any extra keys (optional)
-  for (const [k, v] of Object.entries(variant)) {
-    if (["color", "size", "sku"].includes(k)) continue;
-    if (v === undefined || v === null || v === "") continue;
-    parts.push(`${k}: ${String(v)}`);
-  }
-  return parts.join(" • ");
-}
+function computeTotalsFromOrder(order) {
+  // Prefer stored totals (from your checkout)
+  const subtotal = Number(order?.subtotal ?? 0) || 0;
+  const shipping = Number(order?.shipping?.fee ?? order?.shippingFee ?? 0) || 0;
+  const tax = Number(order?.tax ?? 0) || 0;
+  const couponDiscount = Number(order?.couponDiscount ?? 0) || 0;
+  const coinsDiscount = Number(order?.coinsDiscount ?? order?.coinsApplied ?? 0) || 0;
+  const totalAmount = Number(order?.totalAmount ?? order?.payment?.amount ?? 0) || 0;
 
-function normalizeCustomizationText(customization) {
-  if (!customization) return "";
-  const blocks = Array.isArray(customization) ? customization : [customization];
-  const lines = [];
+  // If subtotal missing, compute from items
+  const items = normalizeItems(order?.items);
+  const computedSubtotal =
+    subtotal > 0 ? subtotal : items.reduce((s, it) => s + (it.price || 0) * (it.quantity || 1), 0);
 
-  for (const block of blocks) {
-    if (!block || !block.data) continue;
-    const type = block.type === "image" ? "Image" : block.type === "text" ? "Text" : "Custom";
+  // If totalAmount missing, compute
+  const computedTotal =
+    totalAmount > 0
+      ? totalAmount
+      : computedSubtotal + shipping + tax - couponDiscount - coinsDiscount;
 
-    if (Array.isArray(block.data)) {
-      for (const obj of block.data) {
-        if (!obj || typeof obj !== "object") continue;
-        for (const [k, v] of Object.entries(obj)) {
-          const vv = String(v ?? "").trim();
-          if (!vv) continue;
-          // Don’t include raw image URLs in text list; just mark as attached
-          if (type === "Image") lines.push(`${k}: (image attached)`);
-          else lines.push(`${k}: ${vv}`);
-        }
-      }
-    } else if (typeof block.data === "object") {
-      for (const [k, v] of Object.entries(block.data)) {
-        const vv = String(v ?? "").trim();
-        if (!vv) continue;
-        if (type === "Image") lines.push(`${k}: (image attached)`);
-        else lines.push(`${k}: ${vv}`);
-      }
-    }
-  }
-
-  return lines.join(" • ");
-}
-
-function buildReceiptHtmlFromOrder({ order, payproOrderId }) {
-  const storeName = "Secrets Discounts";
-
-  const orderId = order?.orderId || payproOrderId || "-";
-  const createdAt = order?.paidAt || order?.updatedAt || order?.createdAt || order?.timestamp || null;
-
-  const customer = order?.customer || {};
-  const customerName = customer?.fullName || customer?.name || "Customer";
-  const customerEmail = customer?.email || "";
-  const customerPhone = customer?.phone || "";
-  const customerAddress = customer?.address || "";
-  const customerCity = customer?.city || "";
-  const customerState = customer?.state || "";
-  const customerZip = customer?.zipCode || "";
-
-  const items = Array.isArray(order?.items) ? order.items : [];
-  const subtotal = Number(order?.subtotal || 0);
-  const shippingFee = Number(order?.shipping?.fee ?? order?.shippingFee ?? 0);
-  const tax = Number(order?.tax || 0);
-
-  const couponDiscount = Number(order?.couponDiscount || 0);
-  const coinsDiscount = Number(order?.coinsDiscount || 0);
-  const discountTotal = Number(order?.discount || (couponDiscount + coinsDiscount) || 0);
-
-  const totalAmount = Number(order?.totalAmount ?? order?.payment?.amount ?? 0);
-  const statusLabel = "Paid";
-  const payMethod = "Online (PayPro)";
-
-  const safeLogo = RECEIPT_LOGO_URL ? escapeHtml(RECEIPT_LOGO_URL) : "";
-
-  const itemsHtml =
-    items.length > 0
-      ? items
-          .map((it) => {
-            const name = escapeHtml(it?.name || "Item");
-            const img = (it?.image || "").trim();
-            const qty = Number(it?.quantity || 1);
-            const unit = Number(it?.price || 0);
-            const line = unit * qty;
-
-            const variantText = normalizeVariantText(it?.variant);
-            const customText = normalizeCustomizationText(it?.customization);
-
-            return `
-              <tr>
-                <td style="padding:12px 0;border-bottom:1px solid #eef2f7;">
-                  <div style="display:flex;gap:12px;align-items:flex-start;">
-                    ${
-                      img
-                        ? `<img src="${escapeHtml(img)}" alt="${name}" width="56" height="56" style="width:56px;height:56px;object-fit:cover;border-radius:12px;border:1px solid #e5e7eb;background:#f8fafc;" />`
-                        : `<div style="width:56px;height:56px;border-radius:12px;border:1px solid #e5e7eb;background:#f8fafc;"></div>`
-                    }
-                    <div style="min-width:0;">
-                      <div style="font-weight:700;color:#0f172a;line-height:1.25;">${name}</div>
-                      ${
-                        variantText
-                          ? `<div style="margin-top:4px;font-size:12px;color:#475569;">${escapeHtml(
-                              variantText
-                            )}</div>`
-                          : ""
-                      }
-                      ${
-                        customText
-                          ? `<div style="margin-top:4px;font-size:12px;color:#64748b;">${escapeHtml(
-                              customText
-                            )}</div>`
-                          : ""
-                      }
-                      <div style="margin-top:6px;font-size:12px;color:#64748b;">
-                        Qty: <b style="color:#0f172a;">${qty}</b> • Unit: <b style="color:#0f172a;">${moneyPKR(
-              unit
-            )}</b>
-                      </div>
-                    </div>
-                  </div>
-                </td>
-                <td style="padding:12px 0;border-bottom:1px solid #eef2f7;text-align:right;white-space:nowrap;font-weight:700;color:#0f172a;">
-                  ${moneyPKR(line)}
-                </td>
-              </tr>
-            `;
-          })
-          .join("")
-      : `
-        <tr>
-          <td style="padding:12px 0;color:#64748b;">Items detail not available.</td>
-          <td style="padding:12px 0;text-align:right;color:#64748b;">-</td>
-        </tr>
-      `;
-
-  const html = `
-  <div style="font-family: Arial, Helvetica, sans-serif;background:#f5f7fb;padding:24px;">
-    <div style="max-width:720px;margin:0 auto;">
-      <div style="background:#ffffff;border-radius:18px;overflow:hidden;border:1px solid #e5e7eb;box-shadow:0 12px 30px rgba(2,6,23,0.06);">
-        
-        <!-- Header -->
-        <div style="padding:18px 20px;background:linear-gradient(135deg, ${BRAND_PRIMARY}, #0ea5e9);color:#fff;">
-          <div style="display:flex;align-items:center;gap:12px;">
-            ${
-              safeLogo
-                ? `<img src="${safeLogo}" alt="${escapeHtml(
-                    storeName
-                  )}" style="width:42px;height:42px;border-radius:12px;object-fit:cover;background:rgba(255,255,255,0.18);border:1px solid rgba(255,255,255,0.2);" />`
-                : `<div style="width:42px;height:42px;border-radius:12px;background:rgba(255,255,255,0.18);border:1px solid rgba(255,255,255,0.2);"></div>`
-            }
-            <div style="min-width:0;">
-              <div style="font-size:16px;font-weight:800;letter-spacing:0.2px;">${escapeHtml(
-                storeName
-              )}</div>
-              <div style="font-size:12px;opacity:0.95;margin-top:2px;">Payment Receipt</div>
-            </div>
-            <div style="margin-left:auto;text-align:right;">
-              <div style="display:inline-block;padding:6px 10px;border-radius:999px;background:rgba(255,255,255,0.18);border:1px solid rgba(255,255,255,0.22);font-size:12px;font-weight:700;">
-                ${escapeHtml(statusLabel)} ✅
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Body -->
-        <div style="padding:18px 20px;">
-          
-          <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;">
-            <div style="flex:1;min-width:260px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:12px;">
-              <div style="font-size:12px;color:#64748b;">Order</div>
-              <div style="font-size:16px;font-weight:800;color:#0f172a;margin-top:2px;">${escapeHtml(
-                orderId
-              )}</div>
-              <div style="font-size:12px;color:#64748b;margin-top:6px;">
-                Date: <b style="color:#0f172a;">${escapeHtml(safeDateLabel(createdAt))}</b><br/>
-                Payment: <b style="color:#0f172a;">${escapeHtml(payMethod)}</b>
-              </div>
-            </div>
-
-            <div style="flex:1;min-width:260px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:12px;">
-              <div style="font-size:12px;color:#64748b;">Customer</div>
-              <div style="font-size:14px;font-weight:800;color:#0f172a;margin-top:2px;">${escapeHtml(
-                customerName
-              )}</div>
-              <div style="font-size:12px;color:#64748b;margin-top:6px;line-height:1.4;">
-                ${customerEmail ? `Email: <b style="color:#0f172a;">${escapeHtml(customerEmail)}</b><br/>` : ""}
-                ${customerPhone ? `Phone: <b style="color:#0f172a;">${escapeHtml(customerPhone)}</b><br/>` : ""}
-                ${
-                  customerAddress || customerCity || customerState || customerZip
-                    ? `Address: <b style="color:#0f172a;">${escapeHtml(
-                        [customerAddress, customerCity, customerState, customerZip].filter(Boolean).join(", ")
-                      )}</b>`
-                    : ""
-                }
-              </div>
-            </div>
-          </div>
-
-          <!-- Items -->
-          <div style="margin-top:14px;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
-            <div style="padding:12px 14px;background:#ffffff;border-bottom:1px solid #e5e7eb;">
-              <div style="font-weight:800;color:#0f172a;">Items</div>
-            </div>
-            <div style="padding:0 14px;background:#ffffff;">
-              <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
-                <thead>
-                  <tr>
-                    <th align="left" style="padding:12px 0;color:#64748b;font-size:12px;font-weight:700;border-bottom:1px solid #eef2f7;">Product</th>
-                    <th align="right" style="padding:12px 0;color:#64748b;font-size:12px;font-weight:700;border-bottom:1px solid #eef2f7;">Total</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${itemsHtml}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <!-- Totals -->
-          <div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:12px;">
-            <div style="flex:1;min-width:260px;background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;padding:12px;">
-              <div style="font-weight:800;color:#0f172a;margin-bottom:8px;">Summary</div>
-
-              <div style="display:flex;justify-content:space-between;margin:6px 0;color:#334155;font-size:13px;">
-                <span>Subtotal</span><span style="font-weight:700;color:#0f172a;">${moneyPKR(subtotal)}</span>
-              </div>
-
-              <div style="display:flex;justify-content:space-between;margin:6px 0;color:#334155;font-size:13px;">
-                <span>Shipping</span><span style="font-weight:700;color:#0f172a;">${moneyPKR(shippingFee)}</span>
-              </div>
-
-              <div style="display:flex;justify-content:space-between;margin:6px 0;color:#334155;font-size:13px;">
-                <span>Tax</span><span style="font-weight:700;color:#0f172a;">${moneyPKR(tax)}</span>
-              </div>
-
-              ${
-                discountTotal > 0
-                  ? `<div style="display:flex;justify-content:space-between;margin:6px 0;color:#16a34a;font-size:13px;">
-                      <span>Discount</span><span style="font-weight:800;">-${moneyPKR(discountTotal)}</span>
-                    </div>`
-                  : ""
-              }
-
-              <div style="margin-top:10px;border-top:1px dashed #e2e8f0;padding-top:10px;display:flex;justify-content:space-between;align-items:center;">
-                <span style="font-size:14px;font-weight:900;color:#0f172a;">Paid Total</span>
-                <span style="font-size:16px;font-weight:900;color:${BRAND_ACCENT};">${moneyPKR(
-                  totalAmount
-                )}</span>
-              </div>
-            </div>
-
-            <div style="flex:1;min-width:260px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:12px;">
-              <div style="font-weight:800;color:#0f172a;">Need help?</div>
-              <div style="margin-top:6px;color:#475569;font-size:13px;line-height:1.45;">
-                If you have any questions about your order, reply to this email or contact us.
-              </div>
-              ${
-                SUPPORT_EMAIL
-                  ? `<div style="margin-top:8px;font-size:13px;color:#0f172a;">
-                      Support: <a href="mailto:${escapeHtml(
-                        SUPPORT_EMAIL
-                      )}" style="color:${BRAND_PRIMARY};text-decoration:none;font-weight:800;">${escapeHtml(
-                      SUPPORT_EMAIL
-                    )}</a>
-                    </div>`
-                  : ""
-              }
-              ${
-                SITE_URL
-                  ? `<div style="margin-top:6px;font-size:13px;color:#0f172a;">
-                      Website: <a href="${escapeHtml(
-                        SITE_URL
-                      )}" style="color:${BRAND_PRIMARY};text-decoration:none;font-weight:800;">${escapeHtml(
-                      SITE_URL
-                    )}</a>
-                    </div>`
-                  : ""
-              }
-              <div style="margin-top:10px;font-size:12px;color:#64748b;">
-                Payment reference: <b style="color:#0f172a;">${escapeHtml(payproOrderId || orderId)}</b>
-              </div>
-            </div>
-          </div>
-
-        </div>
-
-        <!-- Footer -->
-        <div style="padding:14px 20px;background:#ffffff;border-top:1px solid #e5e7eb;color:#64748b;font-size:12px;">
-          © ${new Date().getFullYear()} ${escapeHtml(storeName)} • Thank you for shopping with us.
-        </div>
-      </div>
-    </div>
-  </div>
-  `;
-
-  return html;
-}
-
-function buildFallbackReceiptHtml({ orderId, amount, customerName, customerEmail }) {
-  const safeName = customerName ? String(customerName) : "Customer";
-  const safeEmail = customerEmail ? String(customerEmail) : "";
-  const safeAmount = Number(amount || 0);
-
-  return `
-  <div style="font-family: Arial, sans-serif; padding:16px; color:#111">
-    <h2 style="margin:0 0 8px">Payment Successful ✅</h2>
-    <p style="margin:0 0 12px">Hi <b>${escapeHtml(safeName)}</b>, thanks for your order!</p>
-    <div style="border:1px solid #e5e7eb; border-radius:12px; padding:12px; background:#fafafa">
-      <p style="margin:0 0 6px"><b>Order ID:</b> ${escapeHtml(orderId)}</p>
-      <p style="margin:0 0 6px"><b>Paid Amount:</b> Rs ${safeAmount.toFixed(0)}</p>
-      ${safeEmail ? `<p style="margin:0"><b>Email:</b> ${escapeHtml(safeEmail)}</p>` : ""}
-    </div>
-    <p style="margin:12px 0 0; color:#444">If you have any questions, reply to this email.</p>
-    <p style="margin:18px 0 0; font-size:12px; color:#777">© ${new Date().getFullYear()} Secrets Discounts</p>
-  </div>`;
+  return {
+    subtotal: computedSubtotal,
+    shipping,
+    tax,
+    couponDiscount,
+    coinsDiscount,
+    total: computedTotal,
+  };
 }
 
 // -------------------- Resend --------------------
-async function sendReceiptEmailResend({ to, subject, html }) {
+async function sendReceiptEmailResend({ to, subject, html, text }) {
   if (!RESEND_API_KEY) throw new Error("RESEND_API_KEY missing");
   if (!RECEIPT_FROM_EMAIL) throw new Error("RECEIPT_FROM_EMAIL missing");
 
@@ -568,7 +287,15 @@ async function sendReceiptEmailResend({ to, subject, html }) {
       ? `${RECEIPT_FROM_NAME} <${RECEIPT_FROM_EMAIL}>`
       : RECEIPT_FROM_EMAIL;
 
-  const payload = { from, to, subject, html };
+  const payload = {
+    from,
+    to,
+    subject,
+    html,
+    text: text || undefined,
+    reply_to: RECEIPT_REPLY_TO || undefined,
+    bcc: RECEIPT_BCC || undefined,
+  };
 
   const r = await axios.post("https://api.resend.com/emails", payload, {
     headers: {
@@ -583,6 +310,228 @@ async function sendReceiptEmailResend({ to, subject, html }) {
     throw new Error(`Resend error (${r.status}): ${stringifySafe(r.data)}`);
   }
   return r.data;
+}
+
+function buildReceiptText({ orderId, customerName, total }) {
+  return `Payment Successful
+Order ID: ${orderId}
+Customer: ${customerName}
+Total Paid: Rs ${money(total)}
+Thank you for shopping with Secrets Discounts.`;
+}
+
+function buildReceiptHtmlFromOrder({
+  orderId,
+  paidAmount,
+  orderDoc,
+  logoUrl,
+}) {
+  const customer = orderDoc?.customer || {};
+  const name = escapeHtml(customer?.fullName || customer?.name || "Customer");
+  const email = escapeHtml(customer?.email || "");
+  const phone = escapeHtml(customer?.phone || "");
+  const address = escapeHtml(customer?.address || "");
+  const city = escapeHtml(customer?.city || "");
+  const state = escapeHtml(customer?.state || "");
+  const zip = escapeHtml(customer?.zipCode || "");
+  const country = escapeHtml(customer?.country || "Pakistan");
+
+  const createdAt =
+    orderDoc?.createdAt || orderDoc?.timestamp || orderDoc?.paidAt || null;
+
+  const items = normalizeItems(orderDoc?.items);
+  const totals = computeTotalsFromOrder(orderDoc);
+
+  // prefer paidAmount from mapping if provided
+  const totalPaid = Number(paidAmount ?? totals.total ?? 0) || 0;
+
+  const brand = RECEIPT_BRAND_COLOR || "#2563eb";
+  const safeLogo = logoUrl ? escapeHtml(logoUrl) : "";
+
+  const orderStatus = escapeHtml(orderDoc?.orderStatus || "Paid");
+  const paymentGateway = escapeHtml(orderDoc?.payment?.gateway || "PayPro");
+
+  const itemsRows =
+    items.length > 0
+      ? items
+          .map((it) => {
+            const title = escapeHtml(it.name || "");
+            const qty = Number(it.quantity || 1) || 1;
+            const price = Number(it.price || 0) || 0;
+            const line = price * qty;
+
+            const img = (it.image || "").trim();
+            const imgCell = img
+              ? `<img src="${escapeHtml(img)}" width="56" height="56" alt="${title}" style="display:block;border-radius:10px;object-fit:cover;border:1px solid #e5e7eb;background:#fff;" />`
+              : `<div style="width:56px;height:56px;border-radius:10px;border:1px solid #e5e7eb;background:#f3f4f6;"></div>`;
+
+            // variant badges (simple)
+            let variantHtml = "";
+            if (it.variant && typeof it.variant === "object") {
+              const pairs = Object.entries(it.variant)
+                .filter(([, v]) => v !== undefined && v !== null && String(v).trim() !== "")
+                .slice(0, 4)
+                .map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(v)}`);
+              if (pairs.length) {
+                variantHtml = `<div style="margin-top:4px;color:#6b7280;font-size:12px;">${pairs.join(" • ")}</div>`;
+              }
+            }
+
+            return `
+              <tr>
+                <td style="padding:12px 10px;border-bottom:1px solid #eef2f7;vertical-align:top;">
+                  ${imgCell}
+                </td>
+                <td style="padding:12px 10px;border-bottom:1px solid #eef2f7;vertical-align:top;">
+                  <div style="font-weight:600;color:#111827;font-size:14px;line-height:1.25;">${title}</div>
+                  ${variantHtml}
+                </td>
+                <td style="padding:12px 10px;border-bottom:1px solid #eef2f7;vertical-align:top;text-align:center;color:#111827;font-size:13px;">
+                  ${qty}
+                </td>
+                <td style="padding:12px 10px;border-bottom:1px solid #eef2f7;vertical-align:top;text-align:right;color:#111827;font-size:13px;">
+                  Rs ${money(price)}
+                </td>
+                <td style="padding:12px 10px;border-bottom:1px solid #eef2f7;vertical-align:top;text-align:right;color:#111827;font-size:13px;font-weight:600;">
+                  Rs ${money(line)}
+                </td>
+              </tr>
+            `;
+          })
+          .join("")
+      : `
+        <tr>
+          <td colspan="5" style="padding:14px;color:#6b7280;font-size:13px;border-bottom:1px solid #eef2f7;">
+            No items found in this order.
+          </td>
+        </tr>
+      `;
+
+  // totals rows
+  const showDiscount = (Number(totals.couponDiscount || 0) + Number(totals.coinsDiscount || 0)) > 0;
+
+  return `
+  <div style="margin:0;padding:0;background:#f6f7fb;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;background:#f6f7fb;padding:0;margin:0;">
+      <tr>
+        <td align="center" style="padding:24px 12px;">
+          <table role="presentation" width="680" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 8px 24px rgba(15,23,42,0.06);">
+            
+            <!-- Header -->
+            <tr>
+              <td style="padding:18px 20px;background:${brand};color:#fff;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+                  <tr>
+                    <td style="vertical-align:middle;">
+                      ${safeLogo ? `<img src="${safeLogo}" alt="Logo" height="34" style="display:block;max-height:34px;" />` : `<div style="font-weight:800;font-size:18px;">${escapeHtml(RECEIPT_FROM_NAME)}</div>`}
+                      <div style="opacity:0.95;font-size:12px;margin-top:4px;">Official Payment Receipt</div>
+                    </td>
+                    <td style="vertical-align:middle;text-align:right;">
+                      <div style="font-size:14px;font-weight:700;">Payment Successful ✅</div>
+                      <div style="opacity:0.95;font-size:12px;margin-top:4px;">Order: <span style="font-weight:700;">${escapeHtml(orderId)}</span></div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <!-- Body -->
+            <tr>
+              <td style="padding:20px;">
+                
+                <!-- Summary cards -->
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;">
+                  <tr>
+                    <td style="padding:14px;border:1px solid #e5e7eb;border-radius:14px;background:#fafafa;">
+                      <div style="font-size:13px;color:#6b7280;margin-bottom:6px;">Billed To</div>
+                      <div style="font-size:15px;font-weight:700;color:#111827;">${name}</div>
+                      ${email ? `<div style="font-size:13px;color:#374151;margin-top:4px;">${email}</div>` : ""}
+                      ${phone ? `<div style="font-size:13px;color:#374151;margin-top:2px;">${phone}</div>` : ""}
+                      ${(address || city || state || zip) ? `<div style="font-size:12px;color:#6b7280;margin-top:8px;line-height:1.35;">
+                        ${address ? `${address}<br/>` : ""}
+                        ${city ? `${city}, ` : ""}${state ? `${state} ` : ""}${zip ? `${zip}` : ""}<br/>
+                        ${country}
+                      </div>` : ""}
+                    </td>
+                    <td style="width:12px;"></td>
+                    <td style="padding:14px;border:1px solid #e5e7eb;border-radius:14px;background:#ffffff;">
+                      <div style="font-size:13px;color:#6b7280;margin-bottom:6px;">Payment</div>
+                      <div style="font-size:22px;font-weight:800;color:#111827;">Rs ${money(totalPaid)}</div>
+                      <div style="font-size:12px;color:#6b7280;margin-top:6px;">
+                        Status: <span style="font-weight:700;color:#16a34a;">PAID</span><br/>
+                        Gateway: <span style="font-weight:700;">${paymentGateway}</span><br/>
+                        Order Status: <span style="font-weight:700;">${orderStatus}</span><br/>
+                        ${createdAt ? `Date: <span style="font-weight:700;">${escapeHtml(createdAt)}</span>` : ""}
+                      </div>
+                    </td>
+                  </tr>
+                </table>
+
+                <!-- Items table -->
+                <div style="height:16px;"></div>
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
+                  <tr style="background:#f3f4f6;">
+                    <th align="left" style="padding:10px 10px;color:#374151;font-size:12px;font-weight:800;">Item</th>
+                    <th align="left" style="padding:10px 10px;color:#374151;font-size:12px;font-weight:800;">Details</th>
+                    <th align="center" style="padding:10px 10px;color:#374151;font-size:12px;font-weight:800;">Qty</th>
+                    <th align="right" style="padding:10px 10px;color:#374151;font-size:12px;font-weight:800;">Price</th>
+                    <th align="right" style="padding:10px 10px;color:#374151;font-size:12px;font-weight:800;">Total</th>
+                  </tr>
+                  ${itemsRows}
+                </table>
+
+                <!-- Totals -->
+                <div style="height:16px;"></div>
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+                  <tr>
+                    <td></td>
+                    <td style="width:320px;">
+                      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
+                        <tr>
+                          <td style="padding:10px 12px;color:#6b7280;font-size:13px;">Subtotal</td>
+                          <td style="padding:10px 12px;text-align:right;color:#111827;font-size:13px;font-weight:700;">Rs ${money(totals.subtotal)}</td>
+                        </tr>
+                        <tr>
+                          <td style="padding:10px 12px;color:#6b7280;font-size:13px;border-top:1px solid #eef2f7;">Shipping</td>
+                          <td style="padding:10px 12px;text-align:right;color:#111827;font-size:13px;font-weight:700;border-top:1px solid #eef2f7;">Rs ${money(totals.shipping)}</td>
+                        </tr>
+                        <tr>
+                          <td style="padding:10px 12px;color:#6b7280;font-size:13px;border-top:1px solid #eef2f7;">Tax</td>
+                          <td style="padding:10px 12px;text-align:right;color:#111827;font-size:13px;font-weight:700;border-top:1px solid #eef2f7;">Rs ${money(totals.tax)}</td>
+                        </tr>
+                        ${showDiscount ? `
+                          <tr>
+                            <td style="padding:10px 12px;color:#6b7280;font-size:13px;border-top:1px solid #eef2f7;">Discount</td>
+                            <td style="padding:10px 12px;text-align:right;color:#16a34a;font-size:13px;font-weight:800;border-top:1px solid #eef2f7;">-Rs ${money((totals.couponDiscount || 0) + (totals.coinsDiscount || 0))}</td>
+                          </tr>
+                        ` : ""}
+                        <tr>
+                          <td style="padding:12px 12px;color:#111827;font-size:14px;font-weight:900;border-top:1px solid #eef2f7;background:#fafafa;">Grand Total</td>
+                          <td style="padding:12px 12px;text-align:right;color:#111827;font-size:16px;font-weight:900;border-top:1px solid #eef2f7;background:#fafafa;">Rs ${money(totalPaid)}</td>
+                        </tr>
+                      </table>
+                    </td>
+                  </tr>
+                </table>
+
+                <!-- Footer note -->
+                <div style="height:16px;"></div>
+                <div style="padding:14px;border-radius:14px;background:#f8fafc;border:1px solid #e5e7eb;color:#475569;font-size:12px;line-height:1.5;">
+                  If you have any questions, just reply to this email.
+                  <div style="margin-top:8px;color:#64748b;">
+                    © ${new Date().getFullYear()} ${escapeHtml(RECEIPT_FROM_NAME)} • All rights reserved
+                  </div>
+                </div>
+
+              </td>
+            </tr>
+
+          </table>
+        </td>
+      </tr>
+    </table>
+  </div>
+  `;
 }
 
 // -------------------- PayPro AUTH --------------------
@@ -664,37 +613,16 @@ app.get("/health", (req, res) =>
     hasResend: Boolean(RESEND_API_KEY),
     fromEmail: RECEIPT_FROM_EMAIL || null,
     fromName: RECEIPT_FROM_NAME || null,
-    receiptLogo: RECEIPT_LOGO_URL || null,
+    logoUrl: RECEIPT_LOGO_URL || null,
+    brandColor: RECEIPT_BRAND_COLOR || null,
+    replyTo: RECEIPT_REPLY_TO || null,
     firebaseConfigured: Boolean((process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim()),
   })
 );
 
-// GET test for UIS
+// GET test for UIS (only for sanity)
 app.get("/paypro/uis", (req, res) => {
   res.json({ ok: true, message: "UIS is POST callback. GET is only for testing." });
-});
-
-// Test email
-app.get("/api/test-email", async (req, res) => {
-  try {
-    const to = String(req.query.to || "").trim() || RECEIPT_FROM_EMAIL;
-    if (!isEmailValid(to)) return res.status(400).json({ ok: false, message: "Invalid ?to=email" });
-
-    await sendReceiptEmailResend({
-      to,
-      subject: "Test Email - Secrets Discounts",
-      html: buildFallbackReceiptHtml({
-        orderId: `TEST-${Date.now()}`,
-        amount: 100,
-        customerName: "Test Customer",
-        customerEmail: to,
-      }),
-    });
-
-    return res.json({ ok: true, message: "Email sent via Resend" });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e?.message || "Server error" });
-  }
 });
 
 // ✅ Initiate PayPro + SAVE REAL ORDER DOC PATH MAPPING
@@ -794,7 +722,6 @@ app.post("/api/paypro/initiate", async (req, res) => {
           amount: numericAmount,
           redirectUrl: redirectUrl || null,
           status: "initiated",
-          receiptSent: false,
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         },
@@ -802,7 +729,6 @@ app.post("/api/paypro/initiate", async (req, res) => {
       );
     } catch (e) {
       console.log("⚠️ mapping store failed:", e?.message || e);
-      // PayPro still works, but callback receipt/update may fail
     }
 
     return res.status(200).json({
@@ -819,17 +745,18 @@ app.post("/api/paypro/initiate", async (req, res) => {
   }
 });
 
-// ✅ PayPro callback (marks paid in REAL order doc + sends FULL receipt)
-// NOTE: PayPro may POST urlencoded; we already enabled express.urlencoded
+// ✅ PayPro callback (marks paid in REAL order doc + sends receipt)
 app.post("/paypro/uis", async (req, res) => {
   try {
     console.log("✅ PayPro UIS HIT");
     console.log("Headers:", req.headers);
     console.log("Body:", req.body);
 
-    const username = req.body?.username;
-    const password = req.body?.password;
-    const csvinvoiceids = req.body?.csvinvoiceids;
+    // PayPro sometimes uses different casing - normalize:
+    const username = req.body?.username ?? req.body?.Username ?? req.body?.USERName;
+    const password = req.body?.password ?? req.body?.Password ?? req.body?.PASSword;
+    const csvinvoiceids =
+      req.body?.csvinvoiceids ?? req.body?.CSVInvoiceIDs ?? req.body?.csvInvoiceIds;
 
     if (!username || !password || !csvinvoiceids) {
       return res.status(400).json([
@@ -841,6 +768,7 @@ app.post("/paypro/uis", async (req, res) => {
       ]);
     }
 
+    // verify callback creds
     if (PAYPRO_CALLBACK_USERNAME && String(username) !== PAYPRO_CALLBACK_USERNAME) {
       return res.status(401).json(makePayproAck([null], false));
     }
@@ -855,37 +783,36 @@ app.post("/paypro/uis", async (req, res) => {
 
     const fs = await initFirebaseAdmin();
 
-    for (const payproOrderId of ids) {
+    for (const orderId of ids) {
       let mapping = null;
 
       try {
-        const mapSnap = await fs.collection("paypro_mappings").doc(String(payproOrderId)).get();
+        const mapSnap = await fs.collection("paypro_mappings").doc(String(orderId)).get();
         mapping = mapSnap.exists ? mapSnap.data() || null : null;
       } catch (e) {
-        console.log("⚠️ mapping read failed:", payproOrderId, e?.message || e);
+        console.log("⚠️ mapping read failed:", orderId, e?.message || e);
       }
 
       if (!mapping?.orderDocPath) {
-        console.log("⚠️ No mapping found for orderId:", payproOrderId);
+        console.log("⚠️ No mapping found for orderId:", orderId);
         continue;
       }
 
+      // idempotency: agar already paid hai, dubara email na bhejo
       const alreadyPaid = String(mapping.status || "").toLowerCase() === "paid";
-      const alreadyReceiptSent = Boolean(mapping.receiptSent);
 
-      // 1) Update REAL order doc to Paid (idempotent merge)
+      // 1) Update REAL order doc
       try {
         await fs.doc(mapping.orderDocPath).set(
           {
             orderStatus: "Paid",
             paymentMethod: "online",
             payment: {
-              ...(mapping.payment || {}),
               method: "online",
               gateway: "paypro",
               status: "paid",
               amount: Number(mapping.amount || 0),
-              payproOrderId: String(payproOrderId),
+              payproOrderId: String(orderId),
               updatedAt: new Date().toISOString(),
             },
             updatedAt: new Date().toISOString(),
@@ -894,7 +821,7 @@ app.post("/paypro/uis", async (req, res) => {
           { merge: true }
         );
 
-        await fs.collection("paypro_mappings").doc(String(payproOrderId)).set(
+        await fs.collection("paypro_mappings").doc(String(orderId)).set(
           {
             status: "paid",
             paidAt: new Date().toISOString(),
@@ -904,48 +831,42 @@ app.post("/paypro/uis", async (req, res) => {
           { merge: true }
         );
       } catch (e) {
-        console.log("⚠️ order doc update failed:", payproOrderId, e?.message || e);
+        console.log("⚠️ order doc update failed:", orderId, e?.message || e);
       }
 
-      // 2) Fetch order doc (for full receipt)
-      let orderData = null;
+      // 2) Fetch REAL order doc for full receipt
+      let orderDoc = null;
       try {
         const orderSnap = await fs.doc(mapping.orderDocPath).get();
-        orderData = orderSnap.exists ? orderSnap.data() || null : null;
+        orderDoc = orderSnap.exists ? (orderSnap.data() || null) : null;
       } catch (e) {
-        console.log("⚠️ order doc read failed:", payproOrderId, e?.message || e);
+        console.log("⚠️ order fetch failed:", orderId, e?.message || e);
       }
 
-      // 3) Send receipt email (only once)
-      const email = String(mapping.email || orderData?.customer?.email || "").trim();
-      const name = String(mapping.name || orderData?.customer?.fullName || "Customer").trim();
-      const amount = Number(orderData?.totalAmount ?? orderData?.payment?.amount ?? mapping.amount ?? 0) || 0;
+      // 3) Send receipt email (if email exists + not already paid)
+      const email = String(mapping.email || orderDoc?.customer?.email || "").trim();
+      const name = String(mapping.name || orderDoc?.customer?.fullName || "Customer").trim();
+      const amount = Number(mapping.amount || orderDoc?.totalAmount || orderDoc?.payment?.amount || 0) || 0;
 
-      if (alreadyReceiptSent) {
-        console.log("ℹ️ Receipt already sent (skip):", payproOrderId);
-        continue;
-      }
-
-      if (isEmailValid(email)) {
+      if (!alreadyPaid && isEmailValid(email)) {
         try {
-          const html = orderData
-            ? buildReceiptHtmlFromOrder({ order: orderData, payproOrderId })
-            : buildFallbackReceiptHtml({
-                orderId: String(payproOrderId),
-                amount,
-                customerName: name,
-                customerEmail: email,
-              });
+          const html = buildReceiptHtmlFromOrder({
+            orderId,
+            paidAmount: amount,
+            orderDoc: orderDoc || {},
+            logoUrl: RECEIPT_LOGO_URL || "",
+          });
 
           await sendReceiptEmailResend({
             to: email,
-            subject: `Receipt - Order ${payproOrderId} (Paid)`,
+            subject: `Receipt - Order ${orderId} (Paid)`,
             html,
+            text: buildReceiptText({ orderId, customerName: name, total: amount }),
           });
 
-          console.log("✅ Receipt sent:", payproOrderId, "->", email);
+          console.log("✅ Receipt sent:", orderId, "->", email);
 
-          await fs.collection("paypro_mappings").doc(String(payproOrderId)).set(
+          await fs.collection("paypro_mappings").doc(String(orderId)).set(
             {
               receiptSent: true,
               receiptSentAt: new Date().toISOString(),
@@ -953,35 +874,19 @@ app.post("/paypro/uis", async (req, res) => {
             },
             { merge: true }
           );
-
-          // Optional: also mark on order doc
-          try {
-            await fs.doc(mapping.orderDocPath).set(
-              {
-                receiptSent: true,
-                receiptSentAt: new Date().toISOString(),
-                updatedAt: new Date().toISOString(),
-              },
-              { merge: true }
-            );
-          } catch {
-            // ignore
-          }
         } catch (e) {
-          console.log("⚠️ receipt send failed:", payproOrderId, e?.message || e);
+          console.log("⚠️ receipt send failed:", orderId, e?.message || e);
         }
       } else {
-        console.log("⚠️ No valid email for receipt:", payproOrderId, email);
-      }
-
-      if (alreadyPaid && !alreadyReceiptSent) {
-        // paid earlier but receipt not sent; above logic will still send it once
-        console.log("ℹ️ Order was already paid, sent receipt now (if email valid):", payproOrderId);
+        if (alreadyPaid) console.log("ℹ️ Already paid (skip receipt):", orderId);
+        else console.log("⚠️ No valid email in mapping/order for receipt:", orderId);
       }
     }
 
     // PayPro expects array response
-    return res.status(200).json(makePayproAck(ids, true, "Invoice successfully marked as paid"));
+    return res.status(200).json(
+      makePayproAck(ids, true, "Invoice successfully marked as paid")
+    );
   } catch (e) {
     console.log("❌ UIS ERROR:", e?.message || e);
     return res
