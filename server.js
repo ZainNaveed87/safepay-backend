@@ -14,15 +14,12 @@ async function initFirebaseAdmin() {
   const svcJson = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
   if (!svcJson) throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON missing");
 
-  // dynamic import (but you MUST have firebase-admin installed)
   const mod = await import("firebase-admin");
   admin = mod.default || mod;
 
   if (!admin.apps?.length) {
     const creds = JSON.parse(svcJson);
-    admin.initializeApp({
-      credential: admin.credential.cert(creds),
-    });
+    admin.initializeApp({ credential: admin.credential.cert(creds) });
   }
 
   firestore = admin.firestore();
@@ -36,7 +33,9 @@ app.set("trust proxy", 1);
 const PORT = Number(process.env.PORT || 5050);
 
 const FRONTEND_ORIGINS_RAW = process.env.FRONTEND_ORIGIN || "http://localhost:8080";
-const FRONTEND_ORIGINS = FRONTEND_ORIGINS_RAW.split(",").map(s => s.trim()).filter(Boolean);
+const FRONTEND_ORIGINS = FRONTEND_ORIGINS_RAW.split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 // ---- PayPro ENV ----
 const PAYPRO_BASE_URL = (process.env.PAYPRO_BASE_URL || "").replace(/\/$/, "");
@@ -46,8 +45,10 @@ const PAYPRO_CLIENT_SECRET = (process.env.PAYPRO_CLIENT_SECRET || "").trim();
 const PAYPRO_MERCHANT_ID =
   (process.env.PAYPRO_MERCHANT_ID || process.env.PAYPRO_USERNAME || "").trim();
 
-const PAYPRO_RETURN_URL = process.env.PAYPRO_RETURN_URL || "http://localhost:8080/payment/success";
-const PAYPRO_CANCEL_URL = process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel";
+const PAYPRO_RETURN_URL =
+  process.env.PAYPRO_RETURN_URL || "http://localhost:8080/payment/success";
+const PAYPRO_CANCEL_URL =
+  process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel";
 
 const PAYPRO_AUTH_PATH = (process.env.PAYPRO_AUTH_PATH || "/v2/ppro/auth").trim();
 const PAYPRO_CREATE_ORDER_PATH = (process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co").trim();
@@ -73,6 +74,9 @@ app.use(
     credentials: true,
   })
 );
+
+// IMPORTANT: PayPro callback kabhi kabhi urlencoded bhejta hai
+app.use(express.urlencoded({ extended: true }));
 
 app.use(express.json({ limit: "2mb" }));
 
@@ -119,7 +123,7 @@ function isHtmlResponse(headers, body) {
 
 function looksLikeInvalidKeys(body) {
   const s = String(body || "").trim().toLowerCase();
-  return s.includes("invalid keys") || s.includes("invalid key");
+  return s.includes("invalid keys") || s.includes("invalid key") || s.includes("invalid keys");
 }
 
 function detectTokenFromHeaders(headers) {
@@ -139,7 +143,14 @@ function detectTokenFromHeaders(headers) {
 }
 
 function detectTokenFromBody(data) {
-  return data?.token || data?.Token || data?.access_token || data?.data?.token || data?.data?.access_token || null;
+  return (
+    data?.token ||
+    data?.Token ||
+    data?.access_token ||
+    data?.data?.token ||
+    data?.data?.access_token ||
+    null
+  );
 }
 
 function detectRedirectUrl(data) {
@@ -178,6 +189,20 @@ function formatDDMMYYYY(d) {
 function isEmailValid(email) {
   const e = String(email || "").trim();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+}
+
+function safeRoundAmount(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return null;
+  return Math.round(x);
+}
+
+function makePayproAck(ids, ok = true, descOk = "Invoice successfully marked as paid") {
+  return (ids || []).map((id) => ({
+    StatusCode: ok ? "00" : "01",
+    InvoiceID: id ?? null,
+    Description: ok ? descOk : "Invalid Data. Username or password is invalid",
+  }));
 }
 
 // -------------------- Resend --------------------
@@ -244,7 +269,9 @@ async function getPayProToken() {
       : PAYPRO_BASE_URL.replace("://", "://www."),
   ].filter(Boolean);
 
-  const pathCandidates = Array.from(new Set([PAYPRO_AUTH_PATH || "/v2/ppro/auth", "/v2/ppro/auth", "/ppro/auth"]));
+  const pathCandidates = Array.from(
+    new Set([PAYPRO_AUTH_PATH || "/v2/ppro/auth", "/v2/ppro/auth", "/ppro/auth"])
+  );
 
   let lastErr = null;
 
@@ -344,7 +371,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
 
     if (!orderId) return res.status(400).json({ ok: false, message: "orderId is required" });
 
-    // THIS is the “final” requirement for your real path:
+    // required for real order update + receipt mapping
     if (!appId || !uid || !orderDocId) {
       return res.status(400).json({
         ok: false,
@@ -352,8 +379,8 @@ app.post("/api/paypro/initiate", async (req, res) => {
       });
     }
 
-    const numericAmount = Number(amount);
-    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+    const numericAmount = safeRoundAmount(amount);
+    if (!numericAmount || numericAmount <= 0) {
       return res.status(400).json({ ok: false, message: "amount must be > 0" });
     }
 
@@ -371,7 +398,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
       { MerchantId: PAYPRO_MERCHANT_ID },
       {
         OrderNumber: String(orderId),
-        OrderAmount: String(Math.round(numericAmount)),
+        OrderAmount: String(numericAmount),
         OrderDueDate: formatDDMMYYYY(due),
         OrderType: "Service",
         IssueDate: formatDDMMYYYY(now),
@@ -414,11 +441,10 @@ app.post("/api/paypro/initiate", async (req, res) => {
 
     const redirectUrl = detectRedirectUrl(r.data);
 
-    // ✅ FINAL: store exact order doc path mapping for callback
-    // /artifacts/${appId}/users/${uid}/orders/${orderDocId}
+    // ✅ store exact order doc path mapping for callback
+    // orderDocPath = artifacts/${appId}/users/${uid}/orders/${orderDocId}
     try {
       const fs = await initFirebaseAdmin();
-
       const orderDocPath = `artifacts/${appId}/users/${uid}/orders/${orderDocId}`;
 
       await fs.collection("paypro_mappings").doc(String(orderId)).set(
@@ -430,7 +456,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
           orderDocPath,
           email: customerEmail || "",
           name: customerName || "Customer",
-          amount: Math.round(numericAmount),
+          amount: numericAmount,
           redirectUrl: redirectUrl || null,
           status: "initiated",
           createdAt: new Date().toISOString(),
@@ -458,24 +484,39 @@ app.post("/api/paypro/initiate", async (req, res) => {
 });
 
 // ✅ PayPro callback (marks paid in REAL order doc + sends receipt)
+// NOTE: PayPro may POST urlencoded; we already enabled express.urlencoded
 app.post("/paypro/uis", async (req, res) => {
   try {
-    const { username, password, csvinvoiceids } = req.body || {};
+    // log to confirm "receive ho raha hai ya nahi"
+    console.log("✅ PayPro UIS HIT");
+    console.log("Headers:", req.headers);
+    console.log("Body:", req.body);
+
+    const username = req.body?.username;
+    const password = req.body?.password;
+    const csvinvoiceids = req.body?.csvinvoiceids;
 
     if (!username || !password || !csvinvoiceids) {
       return res.status(400).json([
-        { StatusCode: "01", InvoiceID: null, Description: "Invalid Data. Username/password/csvinvoiceids missing" },
+        {
+          StatusCode: "01",
+          InvoiceID: null,
+          Description: "Invalid Data. Username/password/csvinvoiceids missing",
+        },
       ]);
     }
 
-    if (PAYPRO_CALLBACK_USERNAME && username !== PAYPRO_CALLBACK_USERNAME) {
-      return res.status(401).json([{ StatusCode: "01", InvoiceID: null, Description: "Invalid Data. Username or password is invalid" }]);
+    if (PAYPRO_CALLBACK_USERNAME && String(username) !== PAYPRO_CALLBACK_USERNAME) {
+      return res.status(401).json(makePayproAck([null], false));
     }
-    if (PAYPRO_CALLBACK_PASSWORD && password !== PAYPRO_CALLBACK_PASSWORD) {
-      return res.status(401).json([{ StatusCode: "01", InvoiceID: null, Description: "Invalid Data. Username or password is invalid" }]);
+    if (PAYPRO_CALLBACK_PASSWORD && String(password) !== PAYPRO_CALLBACK_PASSWORD) {
+      return res.status(401).json(makePayproAck([null], false));
     }
 
-    const ids = String(csvinvoiceids).split(",").map(s => s.trim()).filter(Boolean);
+    const ids = String(csvinvoiceids)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
 
     const fs = await initFirebaseAdmin();
 
@@ -484,7 +525,7 @@ app.post("/paypro/uis", async (req, res) => {
 
       try {
         const mapSnap = await fs.collection("paypro_mappings").doc(String(orderId)).get();
-        mapping = mapSnap.exists ? (mapSnap.data() || null) : null;
+        mapping = mapSnap.exists ? mapSnap.data() || null : null;
       } catch (e) {
         console.log("⚠️ mapping read failed:", orderId, e?.message || e);
       }
@@ -493,6 +534,9 @@ app.post("/paypro/uis", async (req, res) => {
         console.log("⚠️ No mapping found for orderId:", orderId);
         continue;
       }
+
+      // idempotency: agar already paid hai, dubara email na bhejo
+      const alreadyPaid = String(mapping.status || "").toLowerCase() === "paid";
 
       // 1) Update REAL order doc
       try {
@@ -515,19 +559,24 @@ app.post("/paypro/uis", async (req, res) => {
         );
 
         await fs.collection("paypro_mappings").doc(String(orderId)).set(
-          { status: "paid", paidAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+          {
+            status: "paid",
+            paidAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            lastCallbackAt: new Date().toISOString(),
+          },
           { merge: true }
         );
       } catch (e) {
         console.log("⚠️ order doc update failed:", orderId, e?.message || e);
       }
 
-      // 2) Send receipt email (if email exists)
+      // 2) Send receipt email (if email exists + not already paid)
       const email = String(mapping.email || "").trim();
       const name = String(mapping.name || "Customer").trim();
       const amount = Number(mapping.amount || 0) || 0;
 
-      if (isEmailValid(email)) {
+      if (!alreadyPaid && isEmailValid(email)) {
         try {
           await sendReceiptEmailResend({
             to: email,
@@ -535,24 +584,33 @@ app.post("/paypro/uis", async (req, res) => {
             html: buildReceiptHtml({ orderId, amount, customerName: name, customerEmail: email }),
           });
           console.log("✅ Receipt sent:", orderId, "->", email);
+
+          await fs.collection("paypro_mappings").doc(String(orderId)).set(
+            {
+              receiptSent: true,
+              receiptSentAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+            { merge: true }
+          );
         } catch (e) {
           console.log("⚠️ receipt send failed:", orderId, e?.message || e);
         }
       } else {
-        console.log("⚠️ No valid email in mapping for receipt:", orderId);
+        if (alreadyPaid) console.log("ℹ️ Already paid (skip receipt):", orderId);
+        else console.log("⚠️ No valid email in mapping for receipt:", orderId);
       }
     }
 
     // PayPro expects array response
     return res.status(200).json(
-      ids.map(id => ({
-        StatusCode: "00",
-        InvoiceID: id,
-        Description: "Invoice successfully marked as paid",
-      }))
+      makePayproAck(ids, true, "Invoice successfully marked as paid")
     );
   } catch (e) {
-    return res.status(500).json([{ StatusCode: "02", InvoiceID: null, Description: "Service Failure" }]);
+    console.log("❌ UIS ERROR:", e?.message || e);
+    return res
+      .status(500)
+      .json([{ StatusCode: "02", InvoiceID: null, Description: "Service Failure" }]);
   }
 });
 
