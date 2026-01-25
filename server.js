@@ -4,7 +4,7 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 
-// -------------------- OPTIONAL: Firebase Admin (still optional for order status update) --------------------
+// -------------------- Firebase Admin (optional but required for mapping + order status update) --------------------
 let admin = null;
 let firestore = null;
 
@@ -32,6 +32,7 @@ app.set("trust proxy", 1);
 
 const PORT = Number(process.env.PORT || 5050);
 
+// Allow multiple origins separated by comma
 const FRONTEND_ORIGINS_RAW = process.env.FRONTEND_ORIGIN || "http://localhost:8080";
 const FRONTEND_ORIGINS = FRONTEND_ORIGINS_RAW.split(",")
   .map((s) => s.trim())
@@ -53,7 +54,7 @@ const PAYPRO_CANCEL_URL =
 const PAYPRO_AUTH_PATH = (process.env.PAYPRO_AUTH_PATH || "/v2/ppro/auth").trim();
 const PAYPRO_CREATE_ORDER_PATH = (process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co").trim();
 
-// PayPro callback creds (optional)
+// PayPro UIS callback creds (optional)
 const PAYPRO_CALLBACK_USERNAME =
   (process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || "").trim();
 const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").trim();
@@ -62,7 +63,7 @@ const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").tr
 app.use(
   cors({
     origin: function (origin, cb) {
-      if (!origin) return cb(null, true);
+      if (!origin) return cb(null, true); // allow curl/postman/server-to-server
       if (FRONTEND_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked for origin: ${origin}`), false);
     },
@@ -70,7 +71,7 @@ app.use(
   })
 );
 
-// PayPro callback kabhi kabhi urlencoded bhejta hai
+// PayPro UIS kabhi kabhi urlencoded bhejta hai
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "2mb" }));
 
@@ -316,7 +317,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
     const due = new Date(now);
     due.setDate(now.getDate() + 1);
 
-    // ✅ IMPORTANT: attach order id to return/cancel so pages open with oid
+    // ✅ attach order id to return/cancel so pages open with oid
     const returnUrl = withOrderId(PAYPRO_RETURN_URL, orderId);
     const cancelUrl = withOrderId(PAYPRO_CANCEL_URL, orderId);
 
@@ -376,7 +377,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
 
     const redirectUrl = detectRedirectUrl(r.data);
 
-    // mapping store (optional but recommended)
+    // ✅ store mapping in Firestore (recommended)
     try {
       const fs = await initFirebaseAdmin();
       const orderDocPath = `artifacts/${appId}/users/${uid}/orders/${orderDocId}`;
@@ -419,8 +420,8 @@ app.post("/api/paypro/initiate", async (req, res) => {
   }
 });
 
-// ✅ PayPro callback (NO EMAIL RECEIPT NOW)
-// NOTE: server-to-server only
+// ✅ PayPro UIS callback (NO EMAIL RECEIPT)
+// server-to-server only
 app.post("/paypro/uis", async (req, res) => {
   try {
     console.log("✅ PayPro UIS HIT");
@@ -440,7 +441,7 @@ app.post("/paypro/uis", async (req, res) => {
       ]);
     }
 
-    // If you set callback creds, then enforce. If not set in ENV, skip enforcement.
+    // enforce creds only if set in ENV
     if (PAYPRO_CALLBACK_USERNAME && String(username) !== PAYPRO_CALLBACK_USERNAME) {
       return res.status(401).json(makePayproAck([null], false));
     }
