@@ -4,7 +4,7 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 
-// -------------------- OPTIONAL: Firebase Admin (REQUIRED for auto receipt + order update) --------------------
+// -------------------- OPTIONAL: Firebase Admin (still optional for order status update) --------------------
 let admin = null;
 let firestore = null;
 
@@ -32,8 +32,7 @@ app.set("trust proxy", 1);
 
 const PORT = Number(process.env.PORT || 5050);
 
-const FRONTEND_ORIGINS_RAW =
-  process.env.FRONTEND_ORIGIN || "http://localhost:8080";
+const FRONTEND_ORIGINS_RAW = process.env.FRONTEND_ORIGIN || "http://localhost:8080";
 const FRONTEND_ORIGINS = FRONTEND_ORIGINS_RAW.split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -43,42 +42,21 @@ const PAYPRO_BASE_URL = (process.env.PAYPRO_BASE_URL || "").replace(/\/$/, "");
 const PAYPRO_CLIENT_ID = (process.env.PAYPRO_CLIENT_ID || "").trim();
 const PAYPRO_CLIENT_SECRET = (process.env.PAYPRO_CLIENT_SECRET || "").trim();
 
-const PAYPRO_MERCHANT_ID = (
-  process.env.PAYPRO_MERCHANT_ID ||
-  process.env.PAYPRO_USERNAME ||
-  ""
-).trim();
+const PAYPRO_MERCHANT_ID =
+  (process.env.PAYPRO_MERCHANT_ID || process.env.PAYPRO_USERNAME || "").trim();
 
 const PAYPRO_RETURN_URL =
-  process.env.PAYPRO_RETURN_URL ||
-  "http://localhost:8080/payment/success";
+  (process.env.PAYPRO_RETURN_URL || "http://localhost:8080/payment/success").trim();
 const PAYPRO_CANCEL_URL =
-  process.env.PAYPRO_CANCEL_URL ||
-  "http://localhost:8080/payment/cancel";
+  (process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel").trim();
 
 const PAYPRO_AUTH_PATH = (process.env.PAYPRO_AUTH_PATH || "/v2/ppro/auth").trim();
 const PAYPRO_CREATE_ORDER_PATH = (process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co").trim();
 
-// PayPro callback creds
-const PAYPRO_CALLBACK_USERNAME = (
-  process.env.PAYPRO_CALLBACK_USERNAME ||
-  process.env.PAYPRO_USERNAME ||
-  ""
-).trim();
+// PayPro callback creds (optional)
+const PAYPRO_CALLBACK_USERNAME =
+  (process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || "").trim();
 const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").trim();
-
-// ---- Resend ENV ----
-const RESEND_API_KEY = (process.env.RESEND_API_KEY || "").trim();
-const RECEIPT_FROM_EMAIL = (process.env.RECEIPT_FROM_EMAIL || "").trim();
-const RECEIPT_FROM_NAME = (process.env.RECEIPT_FROM_NAME || "Secrets Discounts").trim();
-
-// ✅ Logo / Brand
-const RECEIPT_LOGO_URL = (process.env.RECEIPT_LOGO_URL || "").trim(); // put your logo url here
-const RECEIPT_BRAND_COLOR = (process.env.RECEIPT_BRAND_COLOR || "#2563eb").trim(); // default blue
-
-// Optional deliverability helpers
-const RECEIPT_REPLY_TO = (process.env.RECEIPT_REPLY_TO || "").trim(); // e.g. support@yourdomain.com
-const RECEIPT_BCC = (process.env.RECEIPT_BCC || "").trim(); // e.g. your accounting email
 
 // -------------------- Middleware --------------------
 app.use(
@@ -92,7 +70,7 @@ app.use(
   })
 );
 
-// IMPORTANT: PayPro callback kabhi kabhi urlencoded bhejta hai
+// PayPro callback kabhi kabhi urlencoded bhejta hai
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "2mb" }));
 
@@ -137,11 +115,6 @@ function isHtmlResponse(headers, body) {
   return false;
 }
 
-function looksLikeInvalidKeys(body) {
-  const s = String(body || "").trim().toLowerCase();
-  return s.includes("invalid keys") || s.includes("invalid key");
-}
-
 function detectTokenFromHeaders(headers) {
   if (!headers) return null;
   return (
@@ -171,6 +144,7 @@ function detectTokenFromBody(data) {
 
 function detectRedirectUrl(data) {
   if (!data) return null;
+
   if (Array.isArray(data)) {
     for (const item of data) {
       const u = detectRedirectUrl(item);
@@ -178,6 +152,7 @@ function detectRedirectUrl(data) {
     }
     return null;
   }
+
   return (
     data.Click2Pay ||
     data.short_Click2Pay ||
@@ -200,11 +175,6 @@ function formatDDMMYYYY(d) {
   return `${dd}/${mm}/${yyyy}`;
 }
 
-function isEmailValid(email) {
-  const e = String(email || "").trim();
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
-}
-
 function safeRoundAmount(n) {
   const x = Number(n);
   if (!Number.isFinite(x)) return null;
@@ -219,319 +189,16 @@ function makePayproAck(ids, ok = true, descOk = "Invoice successfully marked as 
   }));
 }
 
-function escapeHtml(str) {
-  return String(str ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-function money(n) {
-  const x = Number(n || 0);
-  if (!Number.isFinite(x)) return "0";
-  return x.toFixed(0);
-}
-
-function normalizeItems(items) {
-  const arr = Array.isArray(items) ? items : [];
-  return arr
-    .map((it) => ({
-      name: it?.name ?? it?.title ?? "",
-      image: it?.image ?? it?.img ?? "",
-      price: Number(it?.price ?? 0) || 0,
-      quantity: Number(it?.quantity ?? 1) || 1,
-      variant: it?.variant ?? null,
-    }))
-    .filter((x) => x.name || x.image);
-}
-
-function computeTotalsFromOrder(order) {
-  // Prefer stored totals (from your checkout)
-  const subtotal = Number(order?.subtotal ?? 0) || 0;
-  const shipping = Number(order?.shipping?.fee ?? order?.shippingFee ?? 0) || 0;
-  const tax = Number(order?.tax ?? 0) || 0;
-  const couponDiscount = Number(order?.couponDiscount ?? 0) || 0;
-  const coinsDiscount = Number(order?.coinsDiscount ?? order?.coinsApplied ?? 0) || 0;
-  const totalAmount = Number(order?.totalAmount ?? order?.payment?.amount ?? 0) || 0;
-
-  // If subtotal missing, compute from items
-  const items = normalizeItems(order?.items);
-  const computedSubtotal =
-    subtotal > 0 ? subtotal : items.reduce((s, it) => s + (it.price || 0) * (it.quantity || 1), 0);
-
-  // If totalAmount missing, compute
-  const computedTotal =
-    totalAmount > 0
-      ? totalAmount
-      : computedSubtotal + shipping + tax - couponDiscount - coinsDiscount;
-
-  return {
-    subtotal: computedSubtotal,
-    shipping,
-    tax,
-    couponDiscount,
-    coinsDiscount,
-    total: computedTotal,
-  };
-}
-
-// -------------------- Resend --------------------
-async function sendReceiptEmailResend({ to, subject, html, text }) {
-  if (!RESEND_API_KEY) throw new Error("RESEND_API_KEY missing");
-  if (!RECEIPT_FROM_EMAIL) throw new Error("RECEIPT_FROM_EMAIL missing");
-
-  const from =
-    RECEIPT_FROM_NAME && RECEIPT_FROM_NAME.trim()
-      ? `${RECEIPT_FROM_NAME} <${RECEIPT_FROM_EMAIL}>`
-      : RECEIPT_FROM_EMAIL;
-
-  const payload = {
-    from,
-    to,
-    subject,
-    html,
-    text: text || undefined,
-    reply_to: RECEIPT_REPLY_TO || undefined,
-    bcc: RECEIPT_BCC || undefined,
-  };
-
-  const r = await axios.post("https://api.resend.com/emails", payload, {
-    headers: {
-      Authorization: `Bearer ${RESEND_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    timeout: 20000,
-    validateStatus: () => true,
-  });
-
-  if (r.status < 200 || r.status >= 300) {
-    throw new Error(`Resend error (${r.status}): ${stringifySafe(r.data)}`);
+// append order id to urls (so you can show it on success/cancel page)
+function withOrderId(url, orderId) {
+  try {
+    const u = new URL(url);
+    u.searchParams.set("oid", String(orderId));
+    return u.toString();
+  } catch {
+    const sep = String(url).includes("?") ? "&" : "?";
+    return `${url}${sep}oid=${encodeURIComponent(String(orderId))}`;
   }
-  return r.data;
-}
-
-function buildReceiptText({ orderId, customerName, total }) {
-  return `Payment Successful
-Order ID: ${orderId}
-Customer: ${customerName}
-Total Paid: Rs ${money(total)}
-Thank you for shopping with Secrets Discounts.`;
-}
-
-function buildReceiptHtmlFromOrder({
-  orderId,
-  paidAmount,
-  orderDoc,
-  logoUrl,
-}) {
-  const customer = orderDoc?.customer || {};
-  const name = escapeHtml(customer?.fullName || customer?.name || "Customer");
-  const email = escapeHtml(customer?.email || "");
-  const phone = escapeHtml(customer?.phone || "");
-  const address = escapeHtml(customer?.address || "");
-  const city = escapeHtml(customer?.city || "");
-  const state = escapeHtml(customer?.state || "");
-  const zip = escapeHtml(customer?.zipCode || "");
-  const country = escapeHtml(customer?.country || "Pakistan");
-
-  const createdAt =
-    orderDoc?.createdAt || orderDoc?.timestamp || orderDoc?.paidAt || null;
-
-  const items = normalizeItems(orderDoc?.items);
-  const totals = computeTotalsFromOrder(orderDoc);
-
-  // prefer paidAmount from mapping if provided
-  const totalPaid = Number(paidAmount ?? totals.total ?? 0) || 0;
-
-  const brand = RECEIPT_BRAND_COLOR || "#2563eb";
-  const safeLogo = logoUrl ? escapeHtml(logoUrl) : "";
-
-  const orderStatus = escapeHtml(orderDoc?.orderStatus || "Paid");
-  const paymentGateway = escapeHtml(orderDoc?.payment?.gateway || "PayPro");
-
-  const itemsRows =
-    items.length > 0
-      ? items
-          .map((it) => {
-            const title = escapeHtml(it.name || "");
-            const qty = Number(it.quantity || 1) || 1;
-            const price = Number(it.price || 0) || 0;
-            const line = price * qty;
-
-            const img = (it.image || "").trim();
-            const imgCell = img
-              ? `<img src="${escapeHtml(img)}" width="56" height="56" alt="${title}" style="display:block;border-radius:10px;object-fit:cover;border:1px solid #e5e7eb;background:#fff;" />`
-              : `<div style="width:56px;height:56px;border-radius:10px;border:1px solid #e5e7eb;background:#f3f4f6;"></div>`;
-
-            // variant badges (simple)
-            let variantHtml = "";
-            if (it.variant && typeof it.variant === "object") {
-              const pairs = Object.entries(it.variant)
-                .filter(([, v]) => v !== undefined && v !== null && String(v).trim() !== "")
-                .slice(0, 4)
-                .map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(v)}`);
-              if (pairs.length) {
-                variantHtml = `<div style="margin-top:4px;color:#6b7280;font-size:12px;">${pairs.join(" • ")}</div>`;
-              }
-            }
-
-            return `
-              <tr>
-                <td style="padding:12px 10px;border-bottom:1px solid #eef2f7;vertical-align:top;">
-                  ${imgCell}
-                </td>
-                <td style="padding:12px 10px;border-bottom:1px solid #eef2f7;vertical-align:top;">
-                  <div style="font-weight:600;color:#111827;font-size:14px;line-height:1.25;">${title}</div>
-                  ${variantHtml}
-                </td>
-                <td style="padding:12px 10px;border-bottom:1px solid #eef2f7;vertical-align:top;text-align:center;color:#111827;font-size:13px;">
-                  ${qty}
-                </td>
-                <td style="padding:12px 10px;border-bottom:1px solid #eef2f7;vertical-align:top;text-align:right;color:#111827;font-size:13px;">
-                  Rs ${money(price)}
-                </td>
-                <td style="padding:12px 10px;border-bottom:1px solid #eef2f7;vertical-align:top;text-align:right;color:#111827;font-size:13px;font-weight:600;">
-                  Rs ${money(line)}
-                </td>
-              </tr>
-            `;
-          })
-          .join("")
-      : `
-        <tr>
-          <td colspan="5" style="padding:14px;color:#6b7280;font-size:13px;border-bottom:1px solid #eef2f7;">
-            No items found in this order.
-          </td>
-        </tr>
-      `;
-
-  // totals rows
-  const showDiscount = (Number(totals.couponDiscount || 0) + Number(totals.coinsDiscount || 0)) > 0;
-
-  return `
-  <div style="margin:0;padding:0;background:#f6f7fb;">
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;background:#f6f7fb;padding:0;margin:0;">
-      <tr>
-        <td align="center" style="padding:24px 12px;">
-          <table role="presentation" width="680" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 8px 24px rgba(15,23,42,0.06);">
-            
-            <!-- Header -->
-            <tr>
-              <td style="padding:18px 20px;background:${brand};color:#fff;">
-                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
-                  <tr>
-                    <td style="vertical-align:middle;">
-                      ${safeLogo ? `<img src="${safeLogo}" alt="Logo" height="34" style="display:block;max-height:34px;" />` : `<div style="font-weight:800;font-size:18px;">${escapeHtml(RECEIPT_FROM_NAME)}</div>`}
-                      <div style="opacity:0.95;font-size:12px;margin-top:4px;">Official Payment Receipt</div>
-                    </td>
-                    <td style="vertical-align:middle;text-align:right;">
-                      <div style="font-size:14px;font-weight:700;">Payment Successful ✅</div>
-                      <div style="opacity:0.95;font-size:12px;margin-top:4px;">Order: <span style="font-weight:700;">${escapeHtml(orderId)}</span></div>
-                    </td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
-
-            <!-- Body -->
-            <tr>
-              <td style="padding:20px;">
-                
-                <!-- Summary cards -->
-                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;">
-                  <tr>
-                    <td style="padding:14px;border:1px solid #e5e7eb;border-radius:14px;background:#fafafa;">
-                      <div style="font-size:13px;color:#6b7280;margin-bottom:6px;">Billed To</div>
-                      <div style="font-size:15px;font-weight:700;color:#111827;">${name}</div>
-                      ${email ? `<div style="font-size:13px;color:#374151;margin-top:4px;">${email}</div>` : ""}
-                      ${phone ? `<div style="font-size:13px;color:#374151;margin-top:2px;">${phone}</div>` : ""}
-                      ${(address || city || state || zip) ? `<div style="font-size:12px;color:#6b7280;margin-top:8px;line-height:1.35;">
-                        ${address ? `${address}<br/>` : ""}
-                        ${city ? `${city}, ` : ""}${state ? `${state} ` : ""}${zip ? `${zip}` : ""}<br/>
-                        ${country}
-                      </div>` : ""}
-                    </td>
-                    <td style="width:12px;"></td>
-                    <td style="padding:14px;border:1px solid #e5e7eb;border-radius:14px;background:#ffffff;">
-                      <div style="font-size:13px;color:#6b7280;margin-bottom:6px;">Payment</div>
-                      <div style="font-size:22px;font-weight:800;color:#111827;">Rs ${money(totalPaid)}</div>
-                      <div style="font-size:12px;color:#6b7280;margin-top:6px;">
-                        Status: <span style="font-weight:700;color:#16a34a;">PAID</span><br/>
-                        Gateway: <span style="font-weight:700;">${paymentGateway}</span><br/>
-                        Order Status: <span style="font-weight:700;">${orderStatus}</span><br/>
-                        ${createdAt ? `Date: <span style="font-weight:700;">${escapeHtml(createdAt)}</span>` : ""}
-                      </div>
-                    </td>
-                  </tr>
-                </table>
-
-                <!-- Items table -->
-                <div style="height:16px;"></div>
-                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
-                  <tr style="background:#f3f4f6;">
-                    <th align="left" style="padding:10px 10px;color:#374151;font-size:12px;font-weight:800;">Item</th>
-                    <th align="left" style="padding:10px 10px;color:#374151;font-size:12px;font-weight:800;">Details</th>
-                    <th align="center" style="padding:10px 10px;color:#374151;font-size:12px;font-weight:800;">Qty</th>
-                    <th align="right" style="padding:10px 10px;color:#374151;font-size:12px;font-weight:800;">Price</th>
-                    <th align="right" style="padding:10px 10px;color:#374151;font-size:12px;font-weight:800;">Total</th>
-                  </tr>
-                  ${itemsRows}
-                </table>
-
-                <!-- Totals -->
-                <div style="height:16px;"></div>
-                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
-                  <tr>
-                    <td></td>
-                    <td style="width:320px;">
-                      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
-                        <tr>
-                          <td style="padding:10px 12px;color:#6b7280;font-size:13px;">Subtotal</td>
-                          <td style="padding:10px 12px;text-align:right;color:#111827;font-size:13px;font-weight:700;">Rs ${money(totals.subtotal)}</td>
-                        </tr>
-                        <tr>
-                          <td style="padding:10px 12px;color:#6b7280;font-size:13px;border-top:1px solid #eef2f7;">Shipping</td>
-                          <td style="padding:10px 12px;text-align:right;color:#111827;font-size:13px;font-weight:700;border-top:1px solid #eef2f7;">Rs ${money(totals.shipping)}</td>
-                        </tr>
-                        <tr>
-                          <td style="padding:10px 12px;color:#6b7280;font-size:13px;border-top:1px solid #eef2f7;">Tax</td>
-                          <td style="padding:10px 12px;text-align:right;color:#111827;font-size:13px;font-weight:700;border-top:1px solid #eef2f7;">Rs ${money(totals.tax)}</td>
-                        </tr>
-                        ${showDiscount ? `
-                          <tr>
-                            <td style="padding:10px 12px;color:#6b7280;font-size:13px;border-top:1px solid #eef2f7;">Discount</td>
-                            <td style="padding:10px 12px;text-align:right;color:#16a34a;font-size:13px;font-weight:800;border-top:1px solid #eef2f7;">-Rs ${money((totals.couponDiscount || 0) + (totals.coinsDiscount || 0))}</td>
-                          </tr>
-                        ` : ""}
-                        <tr>
-                          <td style="padding:12px 12px;color:#111827;font-size:14px;font-weight:900;border-top:1px solid #eef2f7;background:#fafafa;">Grand Total</td>
-                          <td style="padding:12px 12px;text-align:right;color:#111827;font-size:16px;font-weight:900;border-top:1px solid #eef2f7;background:#fafafa;">Rs ${money(totalPaid)}</td>
-                        </tr>
-                      </table>
-                    </td>
-                  </tr>
-                </table>
-
-                <!-- Footer note -->
-                <div style="height:16px;"></div>
-                <div style="padding:14px;border-radius:14px;background:#f8fafc;border:1px solid #e5e7eb;color:#475569;font-size:12px;line-height:1.5;">
-                  If you have any questions, just reply to this email.
-                  <div style="margin-top:8px;color:#64748b;">
-                    © ${new Date().getFullYear()} ${escapeHtml(RECEIPT_FROM_NAME)} • All rights reserved
-                  </div>
-                </div>
-
-              </td>
-            </tr>
-
-          </table>
-        </td>
-      </tr>
-    </table>
-  </div>
-  `;
 }
 
 // -------------------- PayPro AUTH --------------------
@@ -577,10 +244,6 @@ async function getPayProToken() {
         lastErr = `Auth returned HTML on ${authUrl}`;
         continue;
       }
-      if (looksLikeInvalidKeys(r.data)) {
-        lastErr = `Auth says "InValid Keys" on ${authUrl}`;
-        continue;
-      }
       if (r.status < 200 || r.status >= 300) {
         lastErr = `Auth failed (${r.status}) on ${authUrl}: ${stringifySafe(r.data).slice(0, 200)}`;
         continue;
@@ -610,36 +273,31 @@ app.get("/health", (req, res) =>
     service: "paypro-backend",
     port: PORT,
     allowedOrigins: FRONTEND_ORIGINS,
-    hasResend: Boolean(RESEND_API_KEY),
-    fromEmail: RECEIPT_FROM_EMAIL || null,
-    fromName: RECEIPT_FROM_NAME || null,
-    logoUrl: RECEIPT_LOGO_URL || null,
-    brandColor: RECEIPT_BRAND_COLOR || null,
-    replyTo: RECEIPT_REPLY_TO || null,
     firebaseConfigured: Boolean((process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim()),
+    returnUrl: PAYPRO_RETURN_URL,
+    cancelUrl: PAYPRO_CANCEL_URL,
+    emailReceiptEnabled: false,
+    whatsappEnabled: false,
   })
 );
 
-// GET test for UIS (only for sanity)
+// GET test for UIS
 app.get("/paypro/uis", (req, res) => {
   res.json({ ok: true, message: "UIS is POST callback. GET is only for testing." });
 });
 
 // ✅ Initiate PayPro + SAVE REAL ORDER DOC PATH MAPPING
-// Frontend MUST send: { orderId, amount, customer, description, appId, uid, orderDocId }
 app.post("/api/paypro/initiate", async (req, res) => {
   try {
     requireEnvOrThrow();
 
     const { orderId, amount, customer, description, appId, uid, orderDocId } = req.body || {};
-
     if (!orderId) return res.status(400).json({ ok: false, message: "orderId is required" });
 
-    // required for real order update + receipt mapping
     if (!appId || !uid || !orderDocId) {
       return res.status(400).json({
         ok: false,
-        message: "appId, uid, orderDocId are required (for real Firestore order update + receipt)",
+        message: "appId, uid, orderDocId are required (for Firestore mapping)",
       });
     }
 
@@ -658,6 +316,11 @@ app.post("/api/paypro/initiate", async (req, res) => {
     const due = new Date(now);
     due.setDate(now.getDate() + 1);
 
+    // ✅ IMPORTANT: attach order id to return/cancel so pages open with oid
+    const returnUrl = withOrderId(PAYPRO_RETURN_URL, orderId);
+    const cancelUrl = withOrderId(PAYPRO_CANCEL_URL, orderId);
+
+    // ✅ IMPORTANT: Also set BillMaster Ecommerce_return_url to avoid "empty" in response
     const coPayload = [
       { MerchantId: PAYPRO_MERCHANT_ID },
       {
@@ -671,8 +334,16 @@ app.post("/api/paypro/initiate", async (req, res) => {
         CustomerMobile: customerPhone,
         CustomerEmail: customerEmail || "",
         CustomerAddress: String(description || ""),
-        ReturnURL: PAYPRO_RETURN_URL,
-        CancelURL: PAYPRO_CANCEL_URL,
+
+        // Normal fields:
+        ReturnURL: returnUrl,
+        CancelURL: cancelUrl,
+
+        // Force fields (PayPro shows these in BillMaster):
+        BillMaster: [
+          { FieldName: "Ecommerce_return_url", FieldValue: returnUrl },
+          { FieldName: "Ecommerce_cancel_url", FieldValue: cancelUrl },
+        ],
       },
     ];
 
@@ -705,7 +376,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
 
     const redirectUrl = detectRedirectUrl(r.data);
 
-    // ✅ store exact order doc path mapping for callback
+    // mapping store (optional but recommended)
     try {
       const fs = await initFirebaseAdmin();
       const orderDocPath = `artifacts/${appId}/users/${uid}/orders/${orderDocId}`;
@@ -719,9 +390,12 @@ app.post("/api/paypro/initiate", async (req, res) => {
           orderDocPath,
           email: customerEmail || "",
           name: customerName || "Customer",
+          phone: customerPhone || "",
           amount: numericAmount,
           redirectUrl: redirectUrl || null,
           status: "initiated",
+          returnUrl,
+          cancelUrl,
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         },
@@ -745,18 +419,16 @@ app.post("/api/paypro/initiate", async (req, res) => {
   }
 });
 
-// ✅ PayPro callback (marks paid in REAL order doc + sends receipt)
+// ✅ PayPro callback (NO EMAIL RECEIPT NOW)
+// NOTE: server-to-server only
 app.post("/paypro/uis", async (req, res) => {
   try {
     console.log("✅ PayPro UIS HIT");
-    console.log("Headers:", req.headers);
     console.log("Body:", req.body);
 
-    // PayPro sometimes uses different casing - normalize:
-    const username = req.body?.username ?? req.body?.Username ?? req.body?.USERName;
-    const password = req.body?.password ?? req.body?.Password ?? req.body?.PASSword;
-    const csvinvoiceids =
-      req.body?.csvinvoiceids ?? req.body?.CSVInvoiceIDs ?? req.body?.csvInvoiceIds;
+    const username = req.body?.username;
+    const password = req.body?.password;
+    const csvinvoiceids = req.body?.csvinvoiceids;
 
     if (!username || !password || !csvinvoiceids) {
       return res.status(400).json([
@@ -768,7 +440,7 @@ app.post("/paypro/uis", async (req, res) => {
       ]);
     }
 
-    // verify callback creds
+    // If you set callback creds, then enforce. If not set in ENV, skip enforcement.
     if (PAYPRO_CALLBACK_USERNAME && String(username) !== PAYPRO_CALLBACK_USERNAME) {
       return res.status(401).json(makePayproAck([null], false));
     }
@@ -798,10 +470,7 @@ app.post("/paypro/uis", async (req, res) => {
         continue;
       }
 
-      // idempotency: agar already paid hai, dubara email na bhejo
-      const alreadyPaid = String(mapping.status || "").toLowerCase() === "paid";
-
-      // 1) Update REAL order doc
+      // Update REAL order doc as PAID
       try {
         await fs.doc(mapping.orderDocPath).set(
           {
@@ -833,60 +502,10 @@ app.post("/paypro/uis", async (req, res) => {
       } catch (e) {
         console.log("⚠️ order doc update failed:", orderId, e?.message || e);
       }
-
-      // 2) Fetch REAL order doc for full receipt
-      let orderDoc = null;
-      try {
-        const orderSnap = await fs.doc(mapping.orderDocPath).get();
-        orderDoc = orderSnap.exists ? (orderSnap.data() || null) : null;
-      } catch (e) {
-        console.log("⚠️ order fetch failed:", orderId, e?.message || e);
-      }
-
-      // 3) Send receipt email (if email exists + not already paid)
-      const email = String(mapping.email || orderDoc?.customer?.email || "").trim();
-      const name = String(mapping.name || orderDoc?.customer?.fullName || "Customer").trim();
-      const amount = Number(mapping.amount || orderDoc?.totalAmount || orderDoc?.payment?.amount || 0) || 0;
-
-      if (!alreadyPaid && isEmailValid(email)) {
-        try {
-          const html = buildReceiptHtmlFromOrder({
-            orderId,
-            paidAmount: amount,
-            orderDoc: orderDoc || {},
-            logoUrl: RECEIPT_LOGO_URL || "",
-          });
-
-          await sendReceiptEmailResend({
-            to: email,
-            subject: `Receipt - Order ${orderId} (Paid)`,
-            html,
-            text: buildReceiptText({ orderId, customerName: name, total: amount }),
-          });
-
-          console.log("✅ Receipt sent:", orderId, "->", email);
-
-          await fs.collection("paypro_mappings").doc(String(orderId)).set(
-            {
-              receiptSent: true,
-              receiptSentAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-            },
-            { merge: true }
-          );
-        } catch (e) {
-          console.log("⚠️ receipt send failed:", orderId, e?.message || e);
-        }
-      } else {
-        if (alreadyPaid) console.log("ℹ️ Already paid (skip receipt):", orderId);
-        else console.log("⚠️ No valid email in mapping/order for receipt:", orderId);
-      }
     }
 
     // PayPro expects array response
-    return res.status(200).json(
-      makePayproAck(ids, true, "Invoice successfully marked as paid")
-    );
+    return res.status(200).json(makePayproAck(ids, true, "Invoice successfully marked as paid"));
   } catch (e) {
     console.log("❌ UIS ERROR:", e?.message || e);
     return res
