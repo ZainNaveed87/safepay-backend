@@ -266,6 +266,27 @@ async function getPayProToken() {
   throw err;
 }
 
+// -------------------- PayPro CO Response parsing --------------------
+// Your CO response is usually like:
+// [ {"Status":"00"}, { ... "PayProId":"2598...", "Click2Pay":"..." } ]
+function parseCO(data) {
+  const d = data;
+
+  if (Array.isArray(d)) {
+    const statusObj = d.find((x) => x && typeof x === "object" && "Status" in x) || {};
+    const detailsObj =
+      d.find((x) => x && typeof x === "object" && ("PayProId" in x || "Click2Pay" in x)) || {};
+    return { statusObj, detailsObj };
+  }
+
+  if (d && typeof d === "object") {
+    const statusObj = d.Status ? { Status: d.Status } : {};
+    return { statusObj, detailsObj: d };
+  }
+
+  return { statusObj: {}, detailsObj: {} };
+}
+
 // -------------------- Routes --------------------
 app.get("/", (req, res) => res.send("PayPro backend running."));
 app.get("/health", (req, res) =>
@@ -288,6 +309,7 @@ app.get("/paypro/uis", (req, res) => {
 });
 
 // ✅ Initiate PayPro + SAVE REAL ORDER DOC PATH MAPPING
+// ✅ FIX: save mapping by PayProId AND by orderId (so callback works in both styles)
 app.post("/api/paypro/initiate", async (req, res) => {
   try {
     requireEnvOrThrow();
@@ -377,31 +399,49 @@ app.post("/api/paypro/initiate", async (req, res) => {
 
     const redirectUrl = detectRedirectUrl(r.data);
 
+    // ✅ Extract PayProId (critical)
+    const { statusObj, detailsObj } = parseCO(r.data);
+    const payproId = detailsObj?.PayProId || detailsObj?.PayProID || null;
+    const status = String(statusObj?.Status || detailsObj?.Status || "");
+
     // ✅ store mapping in Firestore (recommended)
+    // We store:
+    // 1) by orderId (old behavior)
+    // 2) by payproId (new behavior - needed when callback doesn't send csvinvoiceids)
     try {
       const fs = await initFirebaseAdmin();
       const orderDocPath = `artifacts/${appId}/users/${uid}/orders/${orderDocId}`;
 
-      await fs.collection("paypro_mappings").doc(String(orderId)).set(
-        {
-          orderId: String(orderId),
-          appId: String(appId),
-          uid: String(uid),
-          orderDocId: String(orderDocId),
-          orderDocPath,
-          email: customerEmail || "",
-          name: customerName || "Customer",
-          phone: customerPhone || "",
-          amount: numericAmount,
-          redirectUrl: redirectUrl || null,
-          status: "initiated",
-          returnUrl,
-          cancelUrl,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
+      const mappingDoc = {
+        orderId: String(orderId),
+        payproId: payproId ? String(payproId) : null,
+        appId: String(appId),
+        uid: String(uid),
+        orderDocId: String(orderDocId),
+        orderDocPath,
+        email: customerEmail || "",
+        name: customerName || "Customer",
+        phone: customerPhone || "",
+        amount: numericAmount,
+        redirectUrl: redirectUrl || null,
+        status: "initiated",
+        payproStatus: status || null,
+        returnUrl,
+        cancelUrl,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      // 1) by orderId
+      await fs.collection("paypro_mappings").doc(String(orderId)).set(mappingDoc, { merge: true });
+
+      // 2) by PayProId (critical for some flows)
+      if (payproId) {
+        await fs
+          .collection("paypro_mappings_by_payproid")
+          .doc(String(payproId))
+          .set(mappingDoc, { merge: true });
+      }
     } catch (e) {
       console.log("⚠️ mapping store failed:", e?.message || e);
     }
@@ -409,6 +449,8 @@ app.post("/api/paypro/initiate", async (req, res) => {
     return res.status(200).json({
       ok: true,
       orderId,
+      payproId: payproId || null,
+      status: status || null,
       redirectUrl: redirectUrl || null,
       raw: r.data,
     });
@@ -422,11 +464,121 @@ app.post("/api/paypro/initiate", async (req, res) => {
 
 // ✅ PayPro UIS callback (NO EMAIL RECEIPT)
 // server-to-server only
+// ✅ FIX: handle BOTH styles:
+// A) old style: {username,password,csvinvoiceids}
+// B) new style: JSON array with Status + PayProId (your logs)
 app.post("/paypro/uis", async (req, res) => {
   try {
     console.log("✅ PayPro UIS HIT");
+    console.log("Headers content-type:", req.headers?.["content-type"]);
     console.log("Body:", req.body);
 
+    const fs = await initFirebaseAdmin();
+
+    // ---------- Style B (JSON array/object) ----------
+    // If PayPro sends JSON array like:
+    // [ {"Status":"00"}, {"PayProId":"2598..."} ]
+    const body = req.body;
+
+    const isJsonArrayStyle = Array.isArray(body);
+    const isJsonObjectStyle = body && typeof body === "object" && !("csvinvoiceids" in body);
+
+    if (isJsonArrayStyle || isJsonObjectStyle) {
+      const { statusObj, detailsObj } = parseCO(body);
+
+      const payproId = detailsObj?.PayProId || detailsObj?.PayProID || null;
+      const status = String(statusObj?.Status || detailsObj?.Status || "");
+
+      if (!payproId) {
+        return res.status(400).json({ ok: false, message: "Missing PayProId in UIS callback" });
+      }
+
+      // ✅ find mapping by payproId
+      let mapping = null;
+      try {
+        const mapSnap = await fs
+          .collection("paypro_mappings_by_payproid")
+          .doc(String(payproId))
+          .get();
+        mapping = mapSnap.exists ? mapSnap.data() || null : null;
+
+        // fallback: some people saved it in same collection with docId=payproId
+        if (!mapping) {
+          const alt = await fs.collection("paypro_mappings").doc(String(payproId)).get();
+          mapping = alt.exists ? alt.data() || null : null;
+        }
+      } catch (e) {
+        console.log("⚠️ mapping read failed by payproId:", payproId, e?.message || e);
+      }
+
+      if (!mapping?.orderDocPath) {
+        console.log("⚠️ No mapping found for payproId:", payproId);
+        return res.status(200).json({ ok: true, note: "mapping not found", payproId, status });
+      }
+
+      const isSuccess = status === "00" || status.toLowerCase() === "paid" || status.toLowerCase() === "success";
+
+      if (isSuccess) {
+        try {
+          await fs.doc(mapping.orderDocPath).set(
+            {
+              orderStatus: "Paid",
+              paymentMethod: "online",
+              payment: {
+                method: "online",
+                gateway: "paypro",
+                status: "paid",
+                amount: Number(mapping.amount || 0),
+                payproId: String(payproId),
+                updatedAt: new Date().toISOString(),
+              },
+              updatedAt: new Date().toISOString(),
+              paidAt: new Date().toISOString(),
+            },
+            { merge: true }
+          );
+
+          // update mapping (both collections)
+          await fs
+            .collection("paypro_mappings_by_payproid")
+            .doc(String(payproId))
+            .set(
+              {
+                status: "paid",
+                payproStatus: status,
+                paidAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                lastCallbackAt: new Date().toISOString(),
+              },
+              { merge: true }
+            );
+
+          if (mapping.orderId) {
+            await fs
+              .collection("paypro_mappings")
+              .doc(String(mapping.orderId))
+              .set(
+                {
+                  status: "paid",
+                  payproStatus: status,
+                  payproId: String(payproId),
+                  paidAt: new Date().toISOString(),
+                  updatedAt: new Date().toISOString(),
+                  lastCallbackAt: new Date().toISOString(),
+                },
+                { merge: true }
+              );
+          }
+        } catch (e) {
+          console.log("⚠️ order doc update failed:", payproId, e?.message || e);
+        }
+      }
+
+      // PayPro might not require ack in this style; but we return ok JSON
+      return res.status(200).json({ ok: true, payproId, status });
+    }
+
+    // ---------- Style A (urlencoded) ----------
     const username = req.body?.username;
     const password = req.body?.password;
     const csvinvoiceids = req.body?.csvinvoiceids;
@@ -453,8 +605,6 @@ app.post("/paypro/uis", async (req, res) => {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
-
-    const fs = await initFirebaseAdmin();
 
     for (const orderId of ids) {
       let mapping = null;
