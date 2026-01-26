@@ -33,7 +33,8 @@ app.set("trust proxy", 1);
 const PORT = Number(process.env.PORT || 5050);
 
 // Allow multiple origins separated by comma
-const FRONTEND_ORIGINS_RAW = process.env.FRONTEND_ORIGIN || "http://localhost:8080";
+const FRONTEND_ORIGINS_RAW =
+  process.env.FRONTEND_ORIGIN || "http://localhost:8080";
 const FRONTEND_ORIGINS = FRONTEND_ORIGINS_RAW.split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -46,17 +47,25 @@ const PAYPRO_CLIENT_SECRET = (process.env.PAYPRO_CLIENT_SECRET || "").trim();
 const PAYPRO_MERCHANT_ID =
   (process.env.PAYPRO_MERCHANT_ID || process.env.PAYPRO_USERNAME || "").trim();
 
-const PAYPRO_RETURN_URL =
-  (process.env.PAYPRO_RETURN_URL || "http://localhost:8080/payment/success").trim();
-const PAYPRO_CANCEL_URL =
-  (process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel").trim();
+const PAYPRO_RETURN_URL = (
+  process.env.PAYPRO_RETURN_URL || "http://localhost:8080/payment/success"
+).trim();
+const PAYPRO_CANCEL_URL = (
+  process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel"
+).trim();
 
 const PAYPRO_AUTH_PATH = (process.env.PAYPRO_AUTH_PATH || "/v2/ppro/auth").trim();
-const PAYPRO_CREATE_ORDER_PATH = (process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co").trim();
+const PAYPRO_CREATE_ORDER_PATH = (
+  process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co"
+).trim();
+
+// ✅ GGOS path (order status by cpayId/PayProId) — used for FINAL reliable verification
+const PAYPRO_GGOS_PATH = (process.env.PAYPRO_GGOS_PATH || "/v2/ppro/ggos").trim();
 
 // PayPro UIS callback creds (optional)
-const PAYPRO_CALLBACK_USERNAME =
-  (process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || "").trim();
+const PAYPRO_CALLBACK_USERNAME = (
+  process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || ""
+).trim();
 const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").trim();
 
 // -------------------- Middleware --------------------
@@ -273,9 +282,12 @@ function parseCO(data) {
   const d = data;
 
   if (Array.isArray(d)) {
-    const statusObj = d.find((x) => x && typeof x === "object" && "Status" in x) || {};
+    const statusObj =
+      d.find((x) => x && typeof x === "object" && "Status" in x) || {};
     const detailsObj =
-      d.find((x) => x && typeof x === "object" && ("PayProId" in x || "Click2Pay" in x)) || {};
+      d.find(
+        (x) => x && typeof x === "object" && ("PayProId" in x || "Click2Pay" in x)
+      ) || {};
     return { statusObj, detailsObj };
   }
 
@@ -287,8 +299,69 @@ function parseCO(data) {
   return { statusObj: {}, detailsObj: {} };
 }
 
+// -------------------- Helper: mark order paid in Firestore --------------------
+async function markOrderPaidByMapping(fs, mapping, { payproId, orderId, payproStatus }) {
+  if (!mapping?.orderDocPath) return { ok: false, message: "mapping.orderDocPath missing" };
+
+  await fs.doc(mapping.orderDocPath).set(
+    {
+      orderStatus: "Paid",
+      paymentMethod: "online",
+      payment: {
+        method: "online",
+        gateway: "paypro",
+        status: "paid",
+        amount: Number(mapping.amount || 0),
+        payproId: payproId ? String(payproId) : null,
+        payproOrderId: orderId ? String(orderId) : null,
+        updatedAt: new Date().toISOString(),
+      },
+      updatedAt: new Date().toISOString(),
+      paidAt: new Date().toISOString(),
+    },
+    { merge: true }
+  );
+
+  // update mapping docs
+  if (payproId) {
+    await fs
+      .collection("paypro_mappings_by_payproid")
+      .doc(String(payproId))
+      .set(
+        {
+          status: "paid",
+          payproStatus: payproStatus || null,
+          paidAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          lastVerifyAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+  }
+
+  if (mapping.orderId) {
+    await fs
+      .collection("paypro_mappings")
+      .doc(String(mapping.orderId))
+      .set(
+        {
+          status: "paid",
+          payproStatus: payproStatus || null,
+          payproId: payproId ? String(payproId) : null,
+          paidAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          lastVerifyAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+  }
+
+  return { ok: true };
+}
+
 // -------------------- Routes --------------------
 app.get("/", (req, res) => res.send("PayPro backend running."));
+
 app.get("/health", (req, res) =>
   res.json({
     ok: true,
@@ -300,6 +373,7 @@ app.get("/health", (req, res) =>
     cancelUrl: PAYPRO_CANCEL_URL,
     emailReceiptEnabled: false,
     whatsappEnabled: false,
+    ggosPath: PAYPRO_GGOS_PATH,
   })
 );
 
@@ -308,8 +382,102 @@ app.get("/paypro/uis", (req, res) => {
   res.json({ ok: true, message: "UIS is POST callback. GET is only for testing." });
 });
 
+// ✅ FINAL: Verify order status by PayProId (cpayId) via GGOS
+// Use this on success page / orders page auto-check
+app.get("/api/paypro/status", async (req, res) => {
+  try {
+    requireEnvOrThrow();
+
+    const cpayId = String(req.query.cpayId || req.query.payproId || "").trim();
+    if (!cpayId) {
+      return res.status(400).json({ ok: false, message: "cpayId (PayProId) is required" });
+    }
+
+    const token = await getPayProToken();
+    const ggosUrl = makeUrl(PAYPRO_BASE_URL, PAYPRO_GGOS_PATH);
+
+    // ✅ GGOS payload (as per PayPro v2 docs examples)
+    const payload = [
+      { MerchantId: PAYPRO_MERCHANT_ID },
+      { userName: PAYPRO_MERCHANT_ID, cpayId: String(cpayId) },
+    ];
+
+    const r = await axios.post(ggosUrl, payload, {
+      headers: { "Content-Type": "application/json", Token: token },
+      timeout: 20000,
+      validateStatus: () => true,
+    });
+
+    console.log("PayPro GGOS URL:", ggosUrl);
+    console.log("PayPro GGOS status:", r.status);
+    console.log("PayPro GGOS body preview:", stringifySafe(r.data).slice(0, 600));
+
+    if (isHtmlResponse(r.headers, r.data)) {
+      return res.status(500).json({
+        ok: false,
+        message: "GGOS returned HTML (wrong route). Check PAYPRO_GGOS_PATH / BASE_URL.",
+        raw: r.data,
+      });
+    }
+    if (r.status < 200 || r.status >= 300) {
+      return res.status(500).json({
+        ok: false,
+        message: `GGOS error (${r.status}): ${stringifySafe(r.data).slice(0, 300)}`,
+        raw: r.data,
+      });
+    }
+
+    const raw = r.data;
+    const txt = typeof raw === "string" ? raw : JSON.stringify(raw);
+    const lower = txt.toLowerCase();
+
+    // ✅ robust "paid" detect (PayPro formats differ)
+    const paid =
+      lower.includes('"status":"00"') ||
+      lower.includes('"statuscode":"00"') ||
+      lower.includes(" paid") ||
+      lower.includes('"paid"') ||
+      lower.includes("success");
+
+    // ✅ If paid -> update Firestore order using mapping by payproId
+    let updated = false;
+    try {
+      if (paid) {
+        const fs = await initFirebaseAdmin();
+
+        let mapping = null;
+        const snap = await fs.collection("paypro_mappings_by_payproid").doc(String(cpayId)).get();
+        mapping = snap.exists ? (snap.data() || null) : null;
+
+        if (!mapping) {
+          const alt = await fs.collection("paypro_mappings").doc(String(cpayId)).get();
+          mapping = alt.exists ? (alt.data() || null) : null;
+        }
+
+        if (mapping?.orderDocPath) {
+          await markOrderPaidByMapping(fs, mapping, {
+            payproId: cpayId,
+            orderId: mapping.orderId || null,
+            payproStatus: "paid_via_ggos",
+          });
+          updated = true;
+        }
+      }
+    } catch (e) {
+      console.log("⚠️ GGOS paid -> firestore update failed:", e?.message || e);
+    }
+
+    return res.status(200).json({ ok: true, cpayId, paid, updated, raw });
+  } catch (err) {
+    return res.status(err?.statusCode || 500).json({
+      ok: false,
+      message: err?.message || "Server error",
+    });
+  }
+});
+
 // ✅ Initiate PayPro + SAVE REAL ORDER DOC PATH MAPPING
-// ✅ FIX: save mapping by PayProId AND by orderId (so callback works in both styles)
+// ✅ save mapping by PayProId AND by orderId
 app.post("/api/paypro/initiate", async (req, res) => {
   try {
     requireEnvOrThrow();
@@ -404,10 +572,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
     const payproId = detailsObj?.PayProId || detailsObj?.PayProID || null;
     const status = String(statusObj?.Status || detailsObj?.Status || "");
 
-    // ✅ store mapping in Firestore (recommended)
-    // We store:
-    // 1) by orderId (old behavior)
-    // 2) by payproId (new behavior - needed when callback doesn't send csvinvoiceids)
+    // ✅ store mapping in Firestore
     try {
       const fs = await initFirebaseAdmin();
       const orderDocPath = `artifacts/${appId}/users/${uid}/orders/${orderDocId}`;
@@ -435,7 +600,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
       // 1) by orderId
       await fs.collection("paypro_mappings").doc(String(orderId)).set(mappingDoc, { merge: true });
 
-      // 2) by PayProId (critical for some flows)
+      // 2) by PayProId
       if (payproId) {
         await fs
           .collection("paypro_mappings_by_payproid")
@@ -462,11 +627,10 @@ app.post("/api/paypro/initiate", async (req, res) => {
   }
 });
 
-// ✅ PayPro UIS callback (NO EMAIL RECEIPT)
-// server-to-server only
-// ✅ FIX: handle BOTH styles:
+// ✅ PayPro UIS callback (still supported, but GGOS is your FINAL reliable verification)
+// ✅ handle BOTH styles:
 // A) old style: {username,password,csvinvoiceids}
-// B) new style: JSON array with Status + PayProId (your logs)
+// B) new style: JSON array with Status + PayProId
 app.post("/paypro/uis", async (req, res) => {
   try {
     console.log("✅ PayPro UIS HIT");
@@ -476,8 +640,6 @@ app.post("/paypro/uis", async (req, res) => {
     const fs = await initFirebaseAdmin();
 
     // ---------- Style B (JSON array/object) ----------
-    // If PayPro sends JSON array like:
-    // [ {"Status":"00"}, {"PayProId":"2598..."} ]
     const body = req.body;
 
     const isJsonArrayStyle = Array.isArray(body);
@@ -493,7 +655,7 @@ app.post("/paypro/uis", async (req, res) => {
         return res.status(400).json({ ok: false, message: "Missing PayProId in UIS callback" });
       }
 
-      // ✅ find mapping by payproId
+      // find mapping by payproId
       let mapping = null;
       try {
         const mapSnap = await fs
@@ -502,7 +664,6 @@ app.post("/paypro/uis", async (req, res) => {
           .get();
         mapping = mapSnap.exists ? mapSnap.data() || null : null;
 
-        // fallback: some people saved it in same collection with docId=payproId
         if (!mapping) {
           const alt = await fs.collection("paypro_mappings").doc(String(payproId)).get();
           mapping = alt.exists ? alt.data() || null : null;
@@ -516,65 +677,33 @@ app.post("/paypro/uis", async (req, res) => {
         return res.status(200).json({ ok: true, note: "mapping not found", payproId, status });
       }
 
-      const isSuccess = status === "00" || status.toLowerCase() === "paid" || status.toLowerCase() === "success";
+      const isSuccess =
+        status === "00" || status.toLowerCase() === "paid" || status.toLowerCase() === "success";
 
       if (isSuccess) {
         try {
-          await fs.doc(mapping.orderDocPath).set(
-            {
-              orderStatus: "Paid",
-              paymentMethod: "online",
-              payment: {
-                method: "online",
-                gateway: "paypro",
-                status: "paid",
-                amount: Number(mapping.amount || 0),
-                payproId: String(payproId),
-                updatedAt: new Date().toISOString(),
-              },
-              updatedAt: new Date().toISOString(),
-              paidAt: new Date().toISOString(),
-            },
-            { merge: true }
-          );
+          await markOrderPaidByMapping(fs, mapping, {
+            payproId: String(payproId),
+            orderId: mapping.orderId || null,
+            payproStatus: status,
+          });
 
-          // update mapping (both collections)
+          // mark callback time
           await fs
             .collection("paypro_mappings_by_payproid")
             .doc(String(payproId))
             .set(
               {
-                status: "paid",
-                payproStatus: status,
-                paidAt: new Date().toISOString(),
-                updatedAt: new Date().toISOString(),
                 lastCallbackAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
               },
               { merge: true }
             );
-
-          if (mapping.orderId) {
-            await fs
-              .collection("paypro_mappings")
-              .doc(String(mapping.orderId))
-              .set(
-                {
-                  status: "paid",
-                  payproStatus: status,
-                  payproId: String(payproId),
-                  paidAt: new Date().toISOString(),
-                  updatedAt: new Date().toISOString(),
-                  lastCallbackAt: new Date().toISOString(),
-                },
-                { merge: true }
-              );
-          }
         } catch (e) {
           console.log("⚠️ order doc update failed:", payproId, e?.message || e);
         }
       }
 
-      // PayPro might not require ack in this style; but we return ok JSON
       return res.status(200).json({ ok: true, payproId, status });
     }
 
@@ -621,32 +750,17 @@ app.post("/paypro/uis", async (req, res) => {
         continue;
       }
 
-      // Update REAL order doc as PAID
       try {
-        await fs.doc(mapping.orderDocPath).set(
-          {
-            orderStatus: "Paid",
-            paymentMethod: "online",
-            payment: {
-              method: "online",
-              gateway: "paypro",
-              status: "paid",
-              amount: Number(mapping.amount || 0),
-              payproOrderId: String(orderId),
-              updatedAt: new Date().toISOString(),
-            },
-            updatedAt: new Date().toISOString(),
-            paidAt: new Date().toISOString(),
-          },
-          { merge: true }
-        );
+        await markOrderPaidByMapping(fs, mapping, {
+          payproId: mapping.payproId || null,
+          orderId: String(orderId),
+          payproStatus: "paid_via_uis",
+        });
 
         await fs.collection("paypro_mappings").doc(String(orderId)).set(
           {
-            status: "paid",
-            paidAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
             lastCallbackAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
           },
           { merge: true }
         );
