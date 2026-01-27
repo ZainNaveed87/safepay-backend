@@ -211,16 +211,14 @@ function withOrderId(url, orderId) {
   }
 }
 
-// ✅ As per PayPro note: pass your callback URL as callback_url on Click2Pay
-function withCallbackUrl(click2payUrl, callbackUrl) {
+// ✅ PayPro "Returning Back" FIX:
+// Click2Pay URL me callback_url add kar do
+function appendCallbackUrl(click2payUrl, callbackUrl) {
   try {
     const u = new URL(click2payUrl);
-    if (!u.searchParams.get("callback_url")) {
-      u.searchParams.set("callback_url", callbackUrl);
-    }
+    u.searchParams.set("callback_url", callbackUrl);
     return u.toString();
   } catch {
-    // fallback
     const sep = String(click2payUrl).includes("?") ? "&" : "?";
     return `${click2payUrl}${sep}callback_url=${encodeURIComponent(callbackUrl)}`;
   }
@@ -374,44 +372,6 @@ async function markOrderPaidByMapping(fs, mapping, { payproId, orderId, payproSt
   return { ok: true };
 }
 
-// -------------------- Helper: GGOS verify (GET first, POST fallback) --------------------
-async function ggosVerify({ token, cpayId }) {
-  const ggosUrl = makeUrl(PAYPRO_BASE_URL, PAYPRO_GGOS_PATH);
-
-  // Many times PayPro expects GET (your screenshot shows POST -> 405)
-  const params = {
-    MerchantId: PAYPRO_MERCHANT_ID,
-    userName: PAYPRO_MERCHANT_ID,
-    cpayId: String(cpayId),
-  };
-
-  // 1) Try GET
-  const rGet = await axios.get(ggosUrl, {
-    params,
-    headers: { Token: token },
-    timeout: 20000,
-    validateStatus: () => true,
-  });
-
-  if (rGet.status !== 405) {
-    return { method: "GET", resp: rGet };
-  }
-
-  // 2) Fallback POST (for cases where GET isn't allowed in other environments)
-  const payload = [
-    { MerchantId: PAYPRO_MERCHANT_ID },
-    { userName: PAYPRO_MERCHANT_ID, cpayId: String(cpayId) },
-  ];
-
-  const rPost = await axios.post(ggosUrl, payload, {
-    headers: { "Content-Type": "application/json", Token: token },
-    timeout: 20000,
-    validateStatus: () => true,
-  });
-
-  return { method: "POST", resp: rPost };
-}
-
 // -------------------- Routes --------------------
 app.get("/", (req, res) => res.send("PayPro backend running."));
 
@@ -424,6 +384,8 @@ app.get("/health", (req, res) =>
     firebaseConfigured: Boolean((process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim()),
     returnUrl: PAYPRO_RETURN_URL,
     cancelUrl: PAYPRO_CANCEL_URL,
+    emailReceiptEnabled: false,
+    whatsappEnabled: false,
     ggosPath: PAYPRO_GGOS_PATH,
   })
 );
@@ -439,18 +401,27 @@ app.get("/api/paypro/status", async (req, res) => {
   try {
     requireEnvOrThrow();
 
-    const cpayId = String(req.query.cpayId || req.query.payproId || req.query.ordId || "").trim();
+    const cpayId = String(req.query.cpayId || req.query.payproId || "").trim();
     if (!cpayId) {
-      return res.status(400).json({ ok: false, message: "cpayId (PayProId/ordId) is required" });
+      return res.status(400).json({ ok: false, message: "cpayId (PayProId) is required" });
     }
 
     const token = await getPayProToken();
+    const ggosUrl = makeUrl(PAYPRO_BASE_URL, PAYPRO_GGOS_PATH);
 
-    const { method, resp } = await ggosVerify({ token, cpayId });
-    const r = resp;
+    // ✅ GGOS payload (as per PayPro v2 docs examples)
+    const payload = [
+      { MerchantId: PAYPRO_MERCHANT_ID },
+      { userName: PAYPRO_MERCHANT_ID, cpayId: String(cpayId) },
+    ];
 
-    console.log("PayPro GGOS URL:", makeUrl(PAYPRO_BASE_URL, PAYPRO_GGOS_PATH));
-    console.log("PayPro GGOS method:", method);
+    const r = await axios.post(ggosUrl, payload, {
+      headers: { "Content-Type": "application/json", Token: token },
+      timeout: 20000,
+      validateStatus: () => true,
+    });
+
+    console.log("PayPro GGOS URL:", ggosUrl);
     console.log("PayPro GGOS status:", r.status);
     console.log("PayPro GGOS body preview:", stringifySafe(r.data).slice(0, 600));
 
@@ -477,8 +448,8 @@ app.get("/api/paypro/status", async (req, res) => {
     const paid =
       lower.includes('"status":"00"') ||
       lower.includes('"statuscode":"00"') ||
-      lower.includes('"paid"') ||
       lower.includes(" paid") ||
+      lower.includes('"paid"') ||
       lower.includes("success");
 
     // ✅ If paid -> update Firestore order using mapping by payproId
@@ -491,7 +462,6 @@ app.get("/api/paypro/status", async (req, res) => {
         const snap = await fs.collection("paypro_mappings_by_payproid").doc(String(cpayId)).get();
         mapping = snap.exists ? (snap.data() || null) : null;
 
-        // fallback (rare): someone stored payproId in paypro_mappings doc id
         if (!mapping) {
           const alt = await fs.collection("paypro_mappings").doc(String(cpayId)).get();
           mapping = alt.exists ? (alt.data() || null) : null;
@@ -510,7 +480,7 @@ app.get("/api/paypro/status", async (req, res) => {
       console.log("⚠️ GGOS paid -> firestore update failed:", e?.message || e);
     }
 
-    return res.status(200).json({ ok: true, cpayId, paid, updated, method, raw });
+    return res.status(200).json({ ok: true, cpayId, paid, updated, raw });
   } catch (err) {
     return res.status(err?.statusCode || 500).json({
       ok: false,
@@ -608,16 +578,17 @@ app.post("/api/paypro/initiate", async (req, res) => {
       });
     }
 
-    // ✅ Extract PayProId + Click2Pay
+    // ✅ Extract PayProId (critical)
     const { statusObj, detailsObj } = parseCO(r.data);
     const payproId = detailsObj?.PayProId || detailsObj?.PayProID || null;
     const status = String(statusObj?.Status || detailsObj?.Status || "");
 
+    // ✅ redirect URL (Click2Pay)
     let redirectUrl = detectRedirectUrl(r.data);
 
-    // ✅ Append callback_url on Click2Pay (per PayPro note)
+    // ✅ MOST IMPORTANT: add callback_url into Click2Pay (Returning Back)
     if (redirectUrl) {
-      redirectUrl = withCallbackUrl(redirectUrl, returnUrl);
+      redirectUrl = appendCallbackUrl(redirectUrl, returnUrl);
     }
 
     // ✅ store mapping in Firestore
@@ -648,7 +619,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
       // 1) by orderId
       await fs.collection("paypro_mappings").doc(String(orderId)).set(mappingDoc, { merge: true });
 
-      // 2) by PayProId (ordId/cpayId)
+      // 2) by PayProId
       if (payproId) {
         await fs
           .collection("paypro_mappings_by_payproid")
@@ -662,7 +633,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
     return res.status(200).json({
       ok: true,
       orderId,
-      payproId: payproId || null, // ✅ THIS IS ordId/cpayId
+      payproId: payproId || null,
       status: status || null,
       redirectUrl: redirectUrl || null,
       raw: r.data,
@@ -736,6 +707,7 @@ app.post("/paypro/uis", async (req, res) => {
             payproStatus: status,
           });
 
+          // mark callback time
           await fs
             .collection("paypro_mappings_by_payproid")
             .doc(String(payproId))
