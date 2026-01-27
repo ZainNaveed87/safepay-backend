@@ -4,7 +4,7 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 
-// -------------------- Firebase Admin (optional but required for mapping + order status update) --------------------
+// -------------------- OPTIONAL: Firebase Admin (still optional for order status update) --------------------
 let admin = null;
 let firestore = null;
 
@@ -32,40 +32,30 @@ app.set("trust proxy", 1);
 
 const PORT = Number(process.env.PORT || 5050);
 
-// Allow multiple origins separated by comma
 const FRONTEND_ORIGINS_RAW = process.env.FRONTEND_ORIGIN || "http://localhost:8080";
 const FRONTEND_ORIGINS = FRONTEND_ORIGINS_RAW.split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
 // ---- PayPro ENV ----
-const PAYPRO_BASE_URL = (process.env.PAYPRO_BASE_URL || "https://api.paypro.com.pk")
-  .trim()
-  .replace(/\/$/, "")
-  .replace("://www.", "://"); // ✅ hard-remove www (prevents ENOTFOUND)
-
+const PAYPRO_BASE_URL = (process.env.PAYPRO_BASE_URL || "").replace(/\/$/, "");
 const PAYPRO_CLIENT_ID = (process.env.PAYPRO_CLIENT_ID || "").trim();
 const PAYPRO_CLIENT_SECRET = (process.env.PAYPRO_CLIENT_SECRET || "").trim();
 
 const PAYPRO_MERCHANT_ID =
   (process.env.PAYPRO_MERCHANT_ID || process.env.PAYPRO_USERNAME || "").trim();
 
-const PAYPRO_RETURN_URL = (
-  process.env.PAYPRO_RETURN_URL || "http://localhost:8080/payment/success"
-).trim();
-
-const PAYPRO_CANCEL_URL = (
-  process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel"
-).trim();
+const PAYPRO_RETURN_URL =
+  (process.env.PAYPRO_RETURN_URL || "http://localhost:8080/payment/success").trim();
+const PAYPRO_CANCEL_URL =
+  (process.env.PAYPRO_CANCEL_URL || "http://localhost:8080/payment/cancel").trim();
 
 const PAYPRO_AUTH_PATH = (process.env.PAYPRO_AUTH_PATH || "/v2/ppro/auth").trim();
 const PAYPRO_CREATE_ORDER_PATH = (process.env.PAYPRO_CREATE_ORDER_PATH || "/v2/ppro/co").trim();
-const PAYPRO_GGOS_PATH = (process.env.PAYPRO_GGOS_PATH || "/v2/ppro/ggos").trim();
 
-// PayPro UIS callback creds (optional)
-const PAYPRO_CALLBACK_USERNAME = (
-  process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || ""
-).trim();
+// PayPro callback creds (optional)
+const PAYPRO_CALLBACK_USERNAME =
+  (process.env.PAYPRO_CALLBACK_USERNAME || process.env.PAYPRO_USERNAME || "").trim();
 const PAYPRO_CALLBACK_PASSWORD = (process.env.PAYPRO_CALLBACK_PASSWORD || "").trim();
 
 // -------------------- Middleware --------------------
@@ -80,7 +70,7 @@ app.use(
   })
 );
 
-// PayPro UIS kabhi kabhi urlencoded bhejta hai
+// PayPro callback kabhi kabhi urlencoded bhejta hai
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "2mb" }));
 
@@ -211,23 +201,7 @@ function withOrderId(url, orderId) {
   }
 }
 
-// ✅ ALWAYS overwrite callback_url (fixes blank callback_url already present)
-function withCallbackUrl(click2payUrl, callbackUrl) {
-  try {
-    const u = new URL(click2payUrl);
-    u.searchParams.set("callback_url", callbackUrl);
-    return u.toString();
-  } catch {
-    const sep = String(click2payUrl).includes("?") ? "&" : "?";
-    return `${click2payUrl}${sep}callback_url=${encodeURIComponent(callbackUrl)}`;
-  }
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// -------------------- PayPro AUTH (no www candidate + retries) --------------------
+// -------------------- PayPro AUTH --------------------
 async function getPayProToken() {
   requireEnvOrThrow();
 
@@ -238,192 +212,61 @@ async function getPayProToken() {
     ClientSecret: PAYPRO_CLIENT_SECRET,
   };
 
-  // ✅ DO NOT try www.* (it causes ENOTFOUND)
-  const baseCandidates = [PAYPRO_BASE_URL];
+  const baseCandidates = [
+    PAYPRO_BASE_URL,
+    PAYPRO_BASE_URL.includes("://www.")
+      ? PAYPRO_BASE_URL.replace("://www.", "://")
+      : PAYPRO_BASE_URL.replace("://", "://www."),
+  ].filter(Boolean);
 
-  // keep a few auth path candidates (some accounts differ)
   const pathCandidates = Array.from(
     new Set([PAYPRO_AUTH_PATH || "/v2/ppro/auth", "/v2/ppro/auth", "/ppro/auth"])
   );
 
-  // retries for PayPro intermittent 500
-  const maxAttempts = 3;
-
   let lastErr = null;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    for (const base of baseCandidates) {
-      for (const path of pathCandidates) {
-        const authUrl = makeUrl(base, path);
+  for (const base of baseCandidates) {
+    for (const path of pathCandidates) {
+      const authUrl = makeUrl(base, path);
 
-        let r;
-        try {
-          r = await axios.post(authUrl, payload, {
-            headers: { "Content-Type": "application/json" },
-            timeout: 20000,
-            validateStatus: () => true,
-          });
-        } catch (e) {
-          lastErr = `Auth request failed (${authUrl}): ${e?.message || e}`;
-          continue;
-        }
+      const r = await axios.post(authUrl, payload, {
+        headers: { "Content-Type": "application/json" },
+        timeout: 20000,
+        validateStatus: () => true,
+      });
 
-        console.log("PayPro AUTH TRY URL:", authUrl);
-        console.log("PayPro AUTH status:", r.status);
-        console.log("PayPro AUTH content-type:", r.headers?.["content-type"]);
-        console.log("PayPro AUTH body preview:", stringifySafe(r.data).slice(0, 220));
+      console.log("PayPro AUTH TRY URL:", authUrl);
+      console.log("PayPro AUTH status:", r.status);
+      console.log("PayPro AUTH content-type:", r.headers?.["content-type"]);
+      console.log("PayPro AUTH body preview:", stringifySafe(r.data).slice(0, 200));
 
-        // HTML means wrong route or PayPro error page
-        if (isHtmlResponse(r.headers, r.data)) {
-          lastErr = `Auth returned HTML on ${authUrl} (PayPro/route issue)`;
-          continue;
-        }
-
-        if (r.status < 200 || r.status >= 300) {
-          lastErr = `Auth failed (${r.status}) on ${authUrl}: ${stringifySafe(r.data).slice(
-            0,
-            220
-          )}`;
-          continue;
-        }
-
-        const token = detectTokenFromHeaders(r.headers) || detectTokenFromBody(r.data);
-        if (!token) {
-          lastErr = `Auth OK but token missing on ${authUrl}`;
-          continue;
-        }
-
-        console.log("✅ PayPro AUTH OK:", authUrl);
-        return token;
+      if (isHtmlResponse(r.headers, r.data)) {
+        lastErr = `Auth returned HTML on ${authUrl}`;
+        continue;
       }
+      if (r.status < 200 || r.status >= 300) {
+        lastErr = `Auth failed (${r.status}) on ${authUrl}: ${stringifySafe(r.data).slice(0, 200)}`;
+        continue;
+      }
+
+      const token = detectTokenFromHeaders(r.headers) || detectTokenFromBody(r.data);
+      if (!token) {
+        lastErr = `Auth OK but token missing on ${authUrl}`;
+        continue;
+      }
+
+      console.log("✅ PayPro AUTH OK:", authUrl);
+      return token;
     }
-
-    // backoff before next attempt
-    await sleep(600 * attempt);
   }
 
-  // ✅ upstream fail -> 502 (so frontend knows gateway down)
-  const err = new Error(lastErr || "PayPro auth failed on all candidates.");
-  err.statusCode = 502;
+  const err = new Error(lastErr || "Auth failed on all candidates.");
+  err.statusCode = 500;
   throw err;
-}
-
-// -------------------- PayPro CO Response parsing --------------------
-function parseCO(data) {
-  const d = data;
-
-  if (Array.isArray(d)) {
-    const statusObj = d.find((x) => x && typeof x === "object" && "Status" in x) || {};
-    const detailsObj =
-      d.find((x) => x && typeof x === "object" && ("PayProId" in x || "Click2Pay" in x)) || {};
-    return { statusObj, detailsObj };
-  }
-
-  if (d && typeof d === "object") {
-    const statusObj = d.Status ? { Status: d.Status } : {};
-    return { statusObj, detailsObj: d };
-  }
-
-  return { statusObj: {}, detailsObj: {} };
-}
-
-// -------------------- Helper: mark order paid in Firestore --------------------
-async function markOrderPaidByMapping(fs, mapping, { payproId, orderId, payproStatus }) {
-  if (!mapping?.orderDocPath) return { ok: false, message: "mapping.orderDocPath missing" };
-
-  await fs.doc(mapping.orderDocPath).set(
-    {
-      orderStatus: "Paid",
-      paymentMethod: "online",
-      payment: {
-        method: "online",
-        gateway: "paypro",
-        status: "paid",
-        amount: Number(mapping.amount || 0),
-        payproId: payproId ? String(payproId) : null,
-        payproOrderId: orderId ? String(orderId) : null,
-        updatedAt: new Date().toISOString(),
-      },
-      updatedAt: new Date().toISOString(),
-      paidAt: new Date().toISOString(),
-    },
-    { merge: true }
-  );
-
-  if (payproId) {
-    await fs
-      .collection("paypro_mappings_by_payproid")
-      .doc(String(payproId))
-      .set(
-        {
-          status: "paid",
-          payproStatus: payproStatus || null,
-          paidAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          lastVerifyAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
-  }
-
-  if (mapping.orderId) {
-    await fs
-      .collection("paypro_mappings")
-      .doc(String(mapping.orderId))
-      .set(
-        {
-          status: "paid",
-          payproStatus: payproStatus || null,
-          payproId: payproId ? String(payproId) : null,
-          paidAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          lastVerifyAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
-  }
-
-  return { ok: true };
-}
-
-// -------------------- Helper: GGOS verify (GET first, POST fallback) --------------------
-async function ggosVerify({ token, cpayId }) {
-  const ggosUrl = makeUrl(PAYPRO_BASE_URL, PAYPRO_GGOS_PATH);
-
-  const params = {
-    MerchantId: PAYPRO_MERCHANT_ID,
-    userName: PAYPRO_MERCHANT_ID,
-    cpayId: String(cpayId),
-  };
-
-  const rGet = await axios.get(ggosUrl, {
-    params,
-    headers: { Token: token },
-    timeout: 20000,
-    validateStatus: () => true,
-  });
-
-  if (rGet.status !== 405) {
-    return { method: "GET", resp: rGet };
-  }
-
-  const payload = [
-    { MerchantId: PAYPRO_MERCHANT_ID },
-    { userName: PAYPRO_MERCHANT_ID, cpayId: String(cpayId) },
-  ];
-
-  const rPost = await axios.post(ggosUrl, payload, {
-    headers: { "Content-Type": "application/json", Token: token },
-    timeout: 20000,
-    validateStatus: () => true,
-  });
-
-  return { method: "POST", resp: rPost };
 }
 
 // -------------------- Routes --------------------
 app.get("/", (req, res) => res.send("PayPro backend running."));
-
 app.get("/health", (req, res) =>
   res.json({
     ok: true,
@@ -433,97 +276,14 @@ app.get("/health", (req, res) =>
     firebaseConfigured: Boolean((process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim()),
     returnUrl: PAYPRO_RETURN_URL,
     cancelUrl: PAYPRO_CANCEL_URL,
-    ggosPath: PAYPRO_GGOS_PATH,
-    baseUrl: PAYPRO_BASE_URL,
-    authPath: PAYPRO_AUTH_PATH,
-    coPath: PAYPRO_CREATE_ORDER_PATH,
+    emailReceiptEnabled: false,
+    whatsappEnabled: false,
   })
 );
 
 // GET test for UIS
 app.get("/paypro/uis", (req, res) => {
   res.json({ ok: true, message: "UIS is POST callback. GET is only for testing." });
-});
-
-// ✅ FINAL: Verify order status by PayProId (cpayId/ordId) via GGOS
-app.get("/api/paypro/status", async (req, res) => {
-  try {
-    requireEnvOrThrow();
-
-    const cpayId = String(req.query.cpayId || req.query.payproId || req.query.ordId || "").trim();
-    if (!cpayId) {
-      return res.status(400).json({ ok: false, message: "cpayId (PayProId/ordId) is required" });
-    }
-
-    const token = await getPayProToken();
-    const { method, resp } = await ggosVerify({ token, cpayId });
-    const r = resp;
-
-    console.log("PayPro GGOS URL:", makeUrl(PAYPRO_BASE_URL, PAYPRO_GGOS_PATH));
-    console.log("PayPro GGOS method:", method);
-    console.log("PayPro GGOS status:", r.status);
-    console.log("PayPro GGOS body preview:", stringifySafe(r.data).slice(0, 600));
-
-    if (isHtmlResponse(r.headers, r.data)) {
-      return res.status(502).json({
-        ok: false,
-        message: "GGOS returned HTML (PayPro/route issue). Check PAYPRO_GGOS_PATH / BASE_URL.",
-        raw: r.data,
-      });
-    }
-    if (r.status < 200 || r.status >= 300) {
-      return res.status(502).json({
-        ok: false,
-        message: `GGOS error (${r.status}): ${stringifySafe(r.data).slice(0, 300)}`,
-        raw: r.data,
-      });
-    }
-
-    const raw = r.data;
-    const txt = typeof raw === "string" ? raw : JSON.stringify(raw);
-    const lower = txt.toLowerCase();
-
-    const paid =
-      lower.includes('"status":"00"') ||
-      lower.includes('"statuscode":"00"') ||
-      lower.includes('"paid"') ||
-      lower.includes(" paid") ||
-      lower.includes("success");
-
-    let updated = false;
-    try {
-      if (paid) {
-        const fs = await initFirebaseAdmin();
-
-        let mapping = null;
-        const snap = await fs.collection("paypro_mappings_by_payproid").doc(String(cpayId)).get();
-        mapping = snap.exists ? snap.data() || null : null;
-
-        if (!mapping) {
-          const alt = await fs.collection("paypro_mappings").doc(String(cpayId)).get();
-          mapping = alt.exists ? alt.data() || null : null;
-        }
-
-        if (mapping?.orderDocPath) {
-          await markOrderPaidByMapping(fs, mapping, {
-            payproId: cpayId,
-            orderId: mapping.orderId || null,
-            payproStatus: "paid_via_ggos",
-          });
-          updated = true;
-        }
-      }
-    } catch (e) {
-      console.log("⚠️ GGOS paid -> firestore update failed:", e?.message || e);
-    }
-
-    return res.status(200).json({ ok: true, cpayId, paid, updated, method, raw });
-  } catch (err) {
-    return res.status(err?.statusCode || 500).json({
-      ok: false,
-      message: err?.message || "Server error",
-    });
-  }
 });
 
 // ✅ Initiate PayPro + SAVE REAL ORDER DOC PATH MAPPING
@@ -556,9 +316,11 @@ app.post("/api/paypro/initiate", async (req, res) => {
     const due = new Date(now);
     due.setDate(now.getDate() + 1);
 
+    // ✅ IMPORTANT: attach order id to return/cancel so pages open with oid
     const returnUrl = withOrderId(PAYPRO_RETURN_URL, orderId);
     const cancelUrl = withOrderId(PAYPRO_CANCEL_URL, orderId);
 
+    // ✅ IMPORTANT: Also set BillMaster Ecommerce_return_url to avoid "empty" in response
     const coPayload = [
       { MerchantId: PAYPRO_MERCHANT_ID },
       {
@@ -573,9 +335,11 @@ app.post("/api/paypro/initiate", async (req, res) => {
         CustomerEmail: customerEmail || "",
         CustomerAddress: String(description || ""),
 
+        // Normal fields:
         ReturnURL: returnUrl,
         CancelURL: cancelUrl,
 
+        // Force fields (PayPro shows these in BillMaster):
         BillMaster: [
           { FieldName: "Ecommerce_return_url", FieldValue: returnUrl },
           { FieldName: "Ecommerce_cancel_url", FieldValue: cancelUrl },
@@ -597,64 +361,46 @@ app.post("/api/paypro/initiate", async (req, res) => {
     console.log("PayPro CO body preview:", stringifySafe(r.data).slice(0, 700));
 
     if (isHtmlResponse(r.headers, r.data)) {
-      return res.status(502).json({
+      return res.status(500).json({
         ok: false,
-        message: "CO returned HTML (PayPro/route issue). Check PAYPRO_CREATE_ORDER_PATH / BASE_URL.",
-        raw: r.data,
+        message: "CO returned HTML (wrong route). Check PAYPRO_CREATE_ORDER_PATH / BASE_URL.",
       });
     }
     if (r.status < 200 || r.status >= 300) {
-      return res.status(502).json({
+      return res.status(500).json({
         ok: false,
         message: `Initiate error (${r.status}): ${stringifySafe(r.data).slice(0, 500)}`,
         raw: r.data,
       });
     }
 
-    const { statusObj, detailsObj } = parseCO(r.data);
-    const payproId = detailsObj?.PayProId || detailsObj?.PayProID || null;
-    const status = String(statusObj?.Status || detailsObj?.Status || "");
+    const redirectUrl = detectRedirectUrl(r.data);
 
-    const redirectUrlOriginal = detectRedirectUrl(r.data);
-    let redirectUrl = redirectUrlOriginal;
-
-    if (redirectUrl) {
-      redirectUrl = withCallbackUrl(redirectUrl, returnUrl);
-    }
-
-    // ✅ store mapping
+    // mapping store (optional but recommended)
     try {
       const fs = await initFirebaseAdmin();
       const orderDocPath = `artifacts/${appId}/users/${uid}/orders/${orderDocId}`;
 
-      const mappingDoc = {
-        orderId: String(orderId),
-        payproId: payproId ? String(payproId) : null,
-        appId: String(appId),
-        uid: String(uid),
-        orderDocId: String(orderDocId),
-        orderDocPath,
-        email: customerEmail || "",
-        name: customerName || "Customer",
-        phone: customerPhone || "",
-        amount: numericAmount,
-        redirectUrl: redirectUrl || null,
-        status: "initiated",
-        payproStatus: status || null,
-        returnUrl,
-        cancelUrl,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-
-      await fs.collection("paypro_mappings").doc(String(orderId)).set(mappingDoc, { merge: true });
-
-      if (payproId) {
-        await fs
-          .collection("paypro_mappings_by_payproid")
-          .doc(String(payproId))
-          .set(mappingDoc, { merge: true });
-      }
+      await fs.collection("paypro_mappings").doc(String(orderId)).set(
+        {
+          orderId: String(orderId),
+          appId: String(appId),
+          uid: String(uid),
+          orderDocId: String(orderDocId),
+          orderDocPath,
+          email: customerEmail || "",
+          name: customerName || "Customer",
+          phone: customerPhone || "",
+          amount: numericAmount,
+          redirectUrl: redirectUrl || null,
+          status: "initiated",
+          returnUrl,
+          cancelUrl,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
     } catch (e) {
       console.log("⚠️ mapping store failed:", e?.message || e);
     }
@@ -662,12 +408,7 @@ app.post("/api/paypro/initiate", async (req, res) => {
     return res.status(200).json({
       ok: true,
       orderId,
-      payproId: payproId || null,
-      status: status || null,
       redirectUrl: redirectUrl || null,
-      redirectUrlOriginal: redirectUrlOriginal || null,
-      returnUrl,
-      cancelUrl,
       raw: r.data,
     });
   } catch (err) {
@@ -678,80 +419,13 @@ app.post("/api/paypro/initiate", async (req, res) => {
   }
 });
 
-// ✅ PayPro UIS callback (supported; GGOS is final verify)
+// ✅ PayPro callback (NO EMAIL RECEIPT NOW)
+// NOTE: server-to-server only
 app.post("/paypro/uis", async (req, res) => {
   try {
     console.log("✅ PayPro UIS HIT");
-    console.log("Headers content-type:", req.headers?.["content-type"]);
     console.log("Body:", req.body);
 
-    const fs = await initFirebaseAdmin();
-
-    const body = req.body;
-    const isJsonArrayStyle = Array.isArray(body);
-    const isJsonObjectStyle = body && typeof body === "object" && !("csvinvoiceids" in body);
-
-    if (isJsonArrayStyle || isJsonObjectStyle) {
-      const { statusObj, detailsObj } = parseCO(body);
-
-      const payproId = detailsObj?.PayProId || detailsObj?.PayProID || null;
-      const status = String(statusObj?.Status || detailsObj?.Status || "");
-
-      if (!payproId) {
-        return res.status(400).json({ ok: false, message: "Missing PayProId in UIS callback" });
-      }
-
-      let mapping = null;
-      try {
-        const mapSnap = await fs
-          .collection("paypro_mappings_by_payproid")
-          .doc(String(payproId))
-          .get();
-        mapping = mapSnap.exists ? mapSnap.data() || null : null;
-
-        if (!mapping) {
-          const alt = await fs.collection("paypro_mappings").doc(String(payproId)).get();
-          mapping = alt.exists ? alt.data() || null : null;
-        }
-      } catch (e) {
-        console.log("⚠️ mapping read failed by payproId:", payproId, e?.message || e);
-      }
-
-      if (!mapping?.orderDocPath) {
-        console.log("⚠️ No mapping found for payproId:", payproId);
-        return res.status(200).json({ ok: true, note: "mapping not found", payproId, status });
-      }
-
-      const isSuccess =
-        status === "00" || status.toLowerCase() === "paid" || status.toLowerCase() === "success";
-
-      if (isSuccess) {
-        try {
-          await markOrderPaidByMapping(fs, mapping, {
-            payproId: String(payproId),
-            orderId: mapping.orderId || null,
-            payproStatus: status,
-          });
-
-          await fs
-            .collection("paypro_mappings_by_payproid")
-            .doc(String(payproId))
-            .set(
-              {
-                lastCallbackAt: new Date().toISOString(),
-                updatedAt: new Date().toISOString(),
-              },
-              { merge: true }
-            );
-        } catch (e) {
-          console.log("⚠️ order doc update failed:", payproId, e?.message || e);
-        }
-      }
-
-      return res.status(200).json({ ok: true, payproId, status });
-    }
-
-    // ---------- Style A (urlencoded) ----------
     const username = req.body?.username;
     const password = req.body?.password;
     const csvinvoiceids = req.body?.csvinvoiceids;
@@ -766,6 +440,7 @@ app.post("/paypro/uis", async (req, res) => {
       ]);
     }
 
+    // If you set callback creds, then enforce. If not set in ENV, skip enforcement.
     if (PAYPRO_CALLBACK_USERNAME && String(username) !== PAYPRO_CALLBACK_USERNAME) {
       return res.status(401).json(makePayproAck([null], false));
     }
@@ -777,6 +452,8 @@ app.post("/paypro/uis", async (req, res) => {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
+
+    const fs = await initFirebaseAdmin();
 
     for (const orderId of ids) {
       let mapping = null;
@@ -793,17 +470,32 @@ app.post("/paypro/uis", async (req, res) => {
         continue;
       }
 
+      // Update REAL order doc as PAID
       try {
-        await markOrderPaidByMapping(fs, mapping, {
-          payproId: mapping.payproId || null,
-          orderId: String(orderId),
-          payproStatus: "paid_via_uis",
-        });
+        await fs.doc(mapping.orderDocPath).set(
+          {
+            orderStatus: "Paid",
+            paymentMethod: "online",
+            payment: {
+              method: "online",
+              gateway: "paypro",
+              status: "paid",
+              amount: Number(mapping.amount || 0),
+              payproOrderId: String(orderId),
+              updatedAt: new Date().toISOString(),
+            },
+            updatedAt: new Date().toISOString(),
+            paidAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
 
         await fs.collection("paypro_mappings").doc(String(orderId)).set(
           {
-            lastCallbackAt: new Date().toISOString(),
+            status: "paid",
+            paidAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
+            lastCallbackAt: new Date().toISOString(),
           },
           { merge: true }
         );
@@ -812,6 +504,7 @@ app.post("/paypro/uis", async (req, res) => {
       }
     }
 
+    // PayPro expects array response
     return res.status(200).json(makePayproAck(ids, true, "Invoice successfully marked as paid"));
   } catch (e) {
     console.log("❌ UIS ERROR:", e?.message || e);
