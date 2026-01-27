@@ -211,6 +211,19 @@ function withOrderId(url, orderId) {
   }
 }
 
+// ✅ PayPro "Returning Back" FIX:
+// Click2Pay URL me callback_url add kar do
+function appendCallbackUrl(click2payUrl, callbackUrl) {
+  try {
+    const u = new URL(click2payUrl);
+    u.searchParams.set("callback_url", callbackUrl);
+    return u.toString();
+  } catch {
+    const sep = String(click2payUrl).includes("?") ? "&" : "?";
+    return `${click2payUrl}${sep}callback_url=${encodeURIComponent(callbackUrl)}`;
+  }
+}
+
 // -------------------- PayPro AUTH --------------------
 async function getPayProToken() {
   requireEnvOrThrow();
@@ -565,12 +578,18 @@ app.post("/api/paypro/initiate", async (req, res) => {
       });
     }
 
-    const redirectUrl = detectRedirectUrl(r.data);
-
     // ✅ Extract PayProId (critical)
     const { statusObj, detailsObj } = parseCO(r.data);
     const payproId = detailsObj?.PayProId || detailsObj?.PayProID || null;
     const status = String(statusObj?.Status || detailsObj?.Status || "");
+
+    // ✅ redirect URL (Click2Pay)
+    let redirectUrl = detectRedirectUrl(r.data);
+
+    // ✅ MOST IMPORTANT: add callback_url into Click2Pay (Returning Back)
+    if (redirectUrl) {
+      redirectUrl = appendCallbackUrl(redirectUrl, returnUrl);
+    }
 
     // ✅ store mapping in Firestore
     try {
